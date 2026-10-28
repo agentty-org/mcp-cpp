@@ -157,6 +157,10 @@ public:
     // Everything this provider can currently do. May be cached by the impl.
     [[nodiscard]] virtual std::vector<Tool> list() const = 0;
 
+    // The server's `instructions` from the handshake: what its tools are for
+    // and when to use them. Empty when the server sent none.
+    [[nodiscard]] virtual std::string instructions() const { return {}; }
+
     // Perform one capability. MUST NOT throw — map any failure to
     // Result::error so the agent can react instead of crashing.
     [[nodiscard]] virtual Result execute(const Request& req) = 0;
