@@ -168,6 +168,39 @@ TEST_CASE("toolset: a result carries effects and changes as typed fields") {
     fs::remove_all(root);
 }
 
+// #7: when the runner can't be started (make not installed, a sandbox that
+// refuses the spawn) `test` said "PASS exit=0". Nothing ran, so it fails.
+TEST_CASE("toolset: test and diagnostics fail when nothing could start") {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / ("mcp_nostart_" + std::to_string(::getpid()));
+    fs::create_directories(root);
+    HostServices svc;
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
+    svc.state = mcp::test::state_at(root);
+    svc.exec  = std::make_shared<mcp::test::PopenExec>();
+    auto p = make_provider(std::move(svc), ToolsetConfig{});
+
+    // PopenExec maps exit 127 (command not found) to StartFailed.
+    const std::string missing = "agentty-no-such-runner-xyz";
+    auto run = [&](const char* tool, const char* cmd) {
+        return p->execute(mcp::cap::Request{tool, mcp::Json{{"command", cmd}}});
+    };
+    auto t = run("test", missing.c_str());
+    CHECK(t.is_error);
+    CHECK(t.text.find("PASS") == std::string::npos);
+    CHECK(t.text.find("did not start") != std::string::npos);
+
+    auto d = run("diagnostics", missing.c_str());
+    CHECK(d.is_error);
+    CHECK(d.text.find("clean build") == std::string::npos);
+
+    // A command that runs and passes still passes.
+    auto ok = run("test", "true");
+    CHECK(!ok.is_error);
+    CHECK(ok.text.rfind("PASS", 0) == 0);
+    fs::remove_all(root);
+}
+
 TEST_CASE("toolset") {
     // ── backend absent → no memory tools registered ──────────────────────
     {

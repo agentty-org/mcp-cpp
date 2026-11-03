@@ -122,6 +122,11 @@ ExecResult run_diagnostics(const Call& call, const DiagnosticsArgs& a, CallExec&
     }
     auto sub = run_via(exec, auto_argv, a.command, /*max_bytes*/100'000,
                        std::chrono::seconds{120});
+    // Nothing ran: an error, not "no diagnostics (clean build)" (which an
+    // unstarted run's empty output used to read as).
+    if (!sub.started)
+        return std::unexpected(ToolError::spawn("could not start the build: "
+                                                + sub.start_error));
     auto output = format_run(sub, std::chrono::seconds{120});
     if (output.empty()) return ToolOutput{"no diagnostics (clean build)", std::nullopt};
 
@@ -287,22 +292,32 @@ ExecResult run_tests(const Call& call, const TestArgs& a, CallExec& exec) {
     for (; run_no < loops; ++run_no) {
         sub = run_via(exec, a.command.empty() ? argv : std::vector<std::string>{},
                       a.command, 200'000, timeout);
-        if (sub.exit_code != 0 || sub.timed_out) break;
+        if (!sub.started || sub.exit_code != 0 || sub.timed_out) break;
     }
     const int runs_done = std::min(run_no + 1, loops);
 
+    // A run that never started (runner not installed, sandbox refused the
+    // spawn) is not a pass: exit_code stays 0 then, which reported PASS.
+    if (!sub.started) {
+        std::string msg = "tests did not start: " + sub.start_error;
+        if (a.command.empty() && !argv.empty())
+            msg += " (tried `" + argv.front() + "`; pass `command` to run something else)";
+        return std::unexpected(ToolError::spawn(std::move(msg)));
+    }
+    const bool passed = sub.exit_code == 0 && !sub.timed_out;
+
     std::string output = format_run(sub, timeout);
     std::ostringstream summary;
-    summary << (sub.exit_code == 0 && !sub.timed_out ? "PASS" : "FAIL")
+    summary << (passed ? "PASS" : "FAIL")
             << " exit=" << sub.exit_code;
     if (sub.timed_out) summary << " timeout=" << a.timeout_seconds << "s";
     if (loops > 1)
         summary << " (run " << runs_done << "/" << loops
-                << (sub.exit_code == 0 && !sub.timed_out ? " all passed" : " — stopped on failure") << ")";
+                << (passed ? " all passed" : " \xe2\x80\x94 stopped on failure") << ")";
     summary << '\n';
     // On failure, lead with a digest of the failing-test lines so the model
     // sees WHICH tests broke without scanning the whole runner log.
-    if ((sub.exit_code != 0 || sub.timed_out) && !output.empty()) {
+    if (!passed && !output.empty()) {
         auto fails = failing_test_lines(output);
         if (!fails.empty()) {
             summary << "\xe2\x9d\x8c Failing test"
