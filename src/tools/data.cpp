@@ -225,17 +225,20 @@ struct QueryArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<QueryArgs> kQueryArgs{
-    util::arg(&QueryArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&QueryArgs::query, "query",
-              "jq-lite path: `.` (whole doc), `.key`, `.[\"key with space\"]`, `[i]` (negative = from end), `[lo:hi]` slice, `[]` iterate, and pipeline verbs `| keys | values | length | type | has(k)`. E.g. `.scripts | keys`, `.dependencies.react`, `.services[].name`."),
-    util::arg(&QueryArgs::path, "path", "A .json file to query. Provide this OR inline `json`."),
-    util::arg(&QueryArgs::json_text, "json", "Inline JSON to query instead of a file."),
-    util::arg(&QueryArgs::raw, "raw", "Print string results unquoted (jq -r)."),
-    util::arg(&QueryArgs::compact, "compact",
-              "Compact one-line JSON per result (default true); false pretty-prints."),
-};
+const util::ArgSpec<QueryArgs>& kQueryArgs() {
+    static const util::ArgSpec<QueryArgs> spec{
+        util::arg(&QueryArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&QueryArgs::query, "query",
+                  "jq-lite path: `.` (whole doc), `.key`, `.[\"key with space\"]`, `[i]` (negative = from end), `[lo:hi]` slice, `[]` iterate, and pipeline verbs `| keys | values | length | type | has(k)`. E.g. `.scripts | keys`, `.dependencies.react`, `.services[].name`."),
+        util::arg(&QueryArgs::path, "path", "A .json file to query. Provide this OR inline `json`."),
+        util::arg(&QueryArgs::json_text, "json", "Inline JSON to query instead of a file."),
+        util::arg(&QueryArgs::raw, "raw", "Print string results unquoted (jq -r)."),
+        util::arg(&QueryArgs::compact, "compact",
+                  "Compact one-line JSON per result (default true); false pretty-prints."),
+    };
+    return spec;
+}
 
 // An empty query means the whole doc; a file or inline JSON is needed.
 std::expected<QueryArgs, ToolError> check_query(QueryArgs a, const util::Bounds&) {
@@ -319,8 +322,8 @@ void register_data_tools(Shells& sh) {
         "`[]` iteration, and `| keys | values | length | type | has(k)`. Each "
         "result prints as one compact JSON line (`raw:true` unquotes strings). "
         "JSON only.",
-        kQueryArgs.schema(), EffectSet{Effect::ReadFs},
-        body<QueryArgs>(run_json_query, kQueryArgs, check_query), 25'000);
+        kQueryArgs().schema(), EffectSet{Effect::ReadFs},
+        body<QueryArgs>(run_json_query, kQueryArgs(), check_query), 25'000);
 }
 
 } // namespace mcp::tools::detail

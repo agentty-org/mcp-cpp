@@ -107,17 +107,20 @@ struct EditItem {
     std::optional<int> line, line_hint, at_line;   // 1-based; first one set wins
 };
 
-const util::ArgSpec<EditItem> kEditItem{
-    util::arg(&EditItem::old_text, "old_string"),   // old_text and other spellings are aliases
-    util::arg(&EditItem::new_text, "new_string"),
-    util::arg(&EditItem::expected, "expected_replacements"),
-    util::arg(&EditItem::count, "count"),
-    util::arg(&EditItem::replace_all, "replace_all"),
-    util::arg(&EditItem::regex, "regex"),
-    util::arg(&EditItem::line, "line"),
-    util::arg(&EditItem::line_hint, "line_hint"),
-    util::arg(&EditItem::at_line, "at_line"),
-};
+const util::ArgSpec<EditItem>& kEditItem() {
+    static const util::ArgSpec<EditItem> spec{
+        util::arg(&EditItem::old_text, "old_string"),   // old_text and other spellings are aliases
+        util::arg(&EditItem::new_text, "new_string"),
+        util::arg(&EditItem::expected, "expected_replacements"),
+        util::arg(&EditItem::count, "count"),
+        util::arg(&EditItem::replace_all, "replace_all"),
+        util::arg(&EditItem::regex, "regex"),
+        util::arg(&EditItem::line, "line"),
+        util::arg(&EditItem::line_hint, "line_hint"),
+        util::arg(&EditItem::at_line, "at_line"),
+    };
+    return spec;
+}
 
 OneEdit to_one_edit(const EditItem& e) {
     const int expected = e.expected ? e.expected : e.count.value_or(0);
@@ -131,7 +134,7 @@ OneEdit to_one_edit(const EditItem& e) {
 struct EditArgs {
     std::string           raw_path;
     std::string           display_description;
-    json                  edits_in;   // the array; each item decodes via kEditItem
+    json                  edits_in;   // the array; each item decodes via kEditItem()
     json                  raw;        // the flat single-edit form, when no array came
     std::optional<util::WorkspacePath> path;
     std::vector<OneEdit>  edits;
@@ -146,7 +149,7 @@ std::expected<EditArgs, ToolError> check_edit_args(EditArgs a, const util::Bound
             if (!a.edits_in[i].is_object())
                 return std::unexpected(ToolError::invalid_args(
                     std::format("edits[{}]: expected object", i)));
-            auto e = kEditItem.decode(a.edits_in[i]);
+            auto e = kEditItem().decode(a.edits_in[i]);
             if (!e) return std::unexpected(std::move(e.error()));
             if (e->old_text.empty())
                 return std::unexpected(ToolError::invalid_args(
@@ -154,7 +157,7 @@ std::expected<EditArgs, ToolError> check_edit_args(EditArgs a, const util::Bound
             a.edits.push_back(to_one_edit(*e));
         }
     } else {
-        auto e = kEditItem.decode(a.raw);
+        auto e = kEditItem().decode(a.raw);
         if (!e) return std::unexpected(std::move(e.error()));
         if (e->old_text.empty())
             return std::unexpected(ToolError::invalid_args(
@@ -1123,21 +1126,23 @@ json edits_shape() {
     };
 }
 
-const util::ArgSpec<EditArgs> kEditArgs = [] {
-    util::ArgSpec<EditArgs> s{
-        util::arg(&EditArgs::raw_path, "path",
-                  "Absolute or relative path of the existing file. Stream this FIRST.")
-            .required("path required"),
-        util::arg(&EditArgs::display_description, "display_description",
-                  "One-line summary shown in the card while edits stream — e.g. "
-                  "'Fix null-deref in auth.cpp'. Stream second."),
-        // The flat single-edit form is accepted too (check_edit_args).
-        util::arg(&EditArgs::edits_in, "edits", "One or more edits, applied in order.")
-            .shape(edits_shape()).advertise_required(),
-    };
-    s.raw(&EditArgs::raw);
-    return s;
-}();
+const util::ArgSpec<EditArgs>& kEditArgs() {
+    static const util::ArgSpec<EditArgs> spec = [] {
+        util::ArgSpec<EditArgs> s{
+            util::arg(&EditArgs::raw_path, "path",
+                      "Absolute or relative path of the existing file. Stream this FIRST.")
+                .required("path required"),
+            util::arg(&EditArgs::display_description, "display_description",
+                      "One-line summary shown in the card while edits stream — e.g. "
+                      "'Fix null-deref in auth.cpp'. Stream second."),
+            // The flat single-edit form is accepted too (check_edit_args).
+            util::arg(&EditArgs::edits_in, "edits", "One or more edits, applied in order.")
+                .shape(edits_shape()).advertise_required(),
+        };
+        s.raw(&EditArgs::raw);
+        return s;}();
+    return spec;
+}
 
 constexpr const char* kEditDescription =
     "Modify an EXISTING file by applying one or more targeted text "
@@ -1433,24 +1438,26 @@ std::expected<ApplyPatchArgs, ToolError> check_apply_patch_args(ApplyPatchArgs a
     return a;
 }
 
-const util::ArgSpec<ApplyPatchArgs> kApplyPatchArgs = [] {
-    util::ArgSpec<ApplyPatchArgs> s{
-        util::arg(&ApplyPatchArgs::raw_path, "path", "Existing file to patch. Stream FIRST.")
-            .required("`path` is required"),
-        util::arg(&ApplyPatchArgs::display_description, "display_description",
-                  "One-line summary shown in the card. Stream second."),
-        util::arg(&ApplyPatchArgs::patch, "patch", "A unified diff for THIS file: one or more hunks starting with `@@ -a,b +c,d @@`, body lines prefixed ` ` (context), `-` (remove), `+` (add). File headers (--- / +++) are optional and ignored. Hunks are fuzzy-located (the @@ line numbers are hints), so a patch still applies after the file drifts; every hunk needs \u22651 context line and all hunks apply atomically (any miss \u2192 nothing written).")
-            .required("`patch` is required"),
-    };
-    return s;
-}();
+const util::ArgSpec<ApplyPatchArgs>& kApplyPatchArgs() {
+    static const util::ArgSpec<ApplyPatchArgs> spec = [] {
+        util::ArgSpec<ApplyPatchArgs> s{
+            util::arg(&ApplyPatchArgs::raw_path, "path", "Existing file to patch. Stream FIRST.")
+                .required("`path` is required"),
+            util::arg(&ApplyPatchArgs::display_description, "display_description",
+                      "One-line summary shown in the card. Stream second."),
+            util::arg(&ApplyPatchArgs::patch, "patch", "A unified diff for THIS file: one or more hunks starting with `@@ -a,b +c,d @@`, body lines prefixed ` ` (context), `-` (remove), `+` (add). File headers (--- / +++) are optional and ignored. Hunks are fuzzy-located (the @@ line numbers are hints), so a patch still applies after the file drifts; every hunk needs \u22651 context line and all hunks apply atomically (any miss \u2192 nothing written).")
+                .required("`patch` is required"),
+        };
+        return s;}();
+    return spec;
+}
 
 } // namespace
 
 void register_edit_tool(Shells& sh) {
-    sh.add("edit", kEditDescription, kEditArgs.schema(),
+    sh.add("edit", kEditDescription, kEditArgs().schema(),
            EffectSet{Effect::ReadFs, Effect::WriteFs},
-           body<EditArgs>(run_edit, kEditArgs, check_edit_args), 40'000);
+           body<EditArgs>(run_edit, kEditArgs(), check_edit_args), 40'000);
 
     sh.add("apply_patch",
         "Apply a unified-diff PATCH to one existing file \u2014 the multi-hunk "
@@ -1462,9 +1469,9 @@ void register_edit_tool(Shells& sh) {
         "atomically: if any can't be placed unambiguously, nothing is "
         "written. Produces a reviewable diff card like `edit`. Use `edit` for "
         "a one-off substitution, `apply_patch` when you already have a diff.",
-        kApplyPatchArgs.schema(),
+        kApplyPatchArgs().schema(),
         EffectSet{Effect::ReadFs, Effect::WriteFs},
-        body<ApplyPatchArgs>(run_apply_patch, kApplyPatchArgs, check_apply_patch_args), 40'000);
+        body<ApplyPatchArgs>(run_apply_patch, kApplyPatchArgs(), check_apply_patch_args), 40'000);
 }
 
 } // namespace mcp::tools::detail

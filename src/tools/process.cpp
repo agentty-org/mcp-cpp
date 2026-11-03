@@ -116,12 +116,15 @@ namespace {
 
 struct StartArgs { std::string command; std::string cwd = "."; };
 
-const util::ArgSpec<StartArgs> kStartArgs{
-    util::arg(&StartArgs::command, "command",
-              "Shell command to run as a persistent background process (dev "
-              "server, file watcher, log tail).").required(),
-    util::arg(&StartArgs::cwd, "cwd", "Working directory, relative to the workspace root."),
-};
+const util::ArgSpec<StartArgs>& kStartArgs() {
+    static const util::ArgSpec<StartArgs> spec{
+        util::arg(&StartArgs::command, "command",
+                  "Shell command to run as a persistent background process (dev "
+                  "server, file watcher, log tail).").required(),
+        util::arg(&StartArgs::cwd, "cwd", "Working directory, relative to the workspace root."),
+    };
+    return spec;
+}
 
 // The cwd must be inside the workspace; resolved to an absolute path.
 std::expected<StartArgs, ToolError> check_start(StartArgs a, const util::Bounds& b) {
@@ -240,16 +243,19 @@ constexpr std::size_t kPollBudget = 30000;
 // wait_ms up to 300 s (the shell tool's max). A long block is safe: the
 // host returns the instant output arrives OR the child exits, and the wait
 // is sliced so a cancel is noticed.
-const util::ArgSpec<PollArgs> kPollArgs{
-    util::arg(&PollArgs::id, "id", "Session id returned by process_start.").required(),
-    util::arg(&PollArgs::max_chars, "max_chars",
-              "Cap on bytes of new output returned this poll (most recent kept).")
-        .range(1000, 30000),
-    util::arg(&PollArgs::wait_ms, "wait_ms",
-              "Block up to this long (ms) waiting for new output. Returns the "
-              "instant output arrives or the process exits, so a big value is "
-              "free for a quiet process.").range(0, 300000),
-};
+const util::ArgSpec<PollArgs>& kPollArgs() {
+    static const util::ArgSpec<PollArgs> spec{
+        util::arg(&PollArgs::id, "id", "Session id returned by process_start.").required(),
+        util::arg(&PollArgs::max_chars, "max_chars",
+                  "Cap on bytes of new output returned this poll (most recent kept).")
+            .range(1000, 30000),
+        util::arg(&PollArgs::wait_ms, "wait_ms",
+                  "Block up to this long (ms) waiting for new output. Returns the "
+                  "instant output arrives or the process exits, so a big value is "
+                  "free for a quiet process.").range(0, 300000),
+    };
+    return spec;
+}
 
 ExecResult run_poll(const Call& call, const PollArgs& args, CallExec&) {
     const auto entry = find_entry(call, args.id);
@@ -297,9 +303,12 @@ ExecResult run_poll(const Call& call, const PollArgs& args, CallExec&) {
 
 struct StopArgs { std::string id; };
 
-const util::ArgSpec<StopArgs> kStopArgs{
-    util::arg(&StopArgs::id, "id", "Session id to terminate and reap.").required(),
-};
+const util::ArgSpec<StopArgs>& kStopArgs() {
+    static const util::ArgSpec<StopArgs> spec{
+        util::arg(&StopArgs::id, "id", "Session id to terminate and reap.").required(),
+    };
+    return spec;
+}
 
 ExecResult run_stop(const Call& call, const StopArgs& args, CallExec&) {
     // Out of the map first: from here this call is the only one that can
@@ -336,20 +345,20 @@ void register_process_tools(Shells& shells, const std::shared_ptr<Exec>& exec) {
         "and return a session id. Waits ~300ms so an immediate crash is reported "
         "right away with its exit code and output; otherwise it keeps running for "
         "process_poll (incremental output) and process_stop (cleanup).",
-        kStartArgs.schema(), EffectSet{Effect::Exec},
-        body<StartArgs>([exec](const Call& c, const StartArgs& a) { CallExec ce{*exec, c}; return run_start(c, a, ce); }, kStartArgs, check_start), 4000);
+        kStartArgs().schema(), EffectSet{Effect::Exec},
+        body<StartArgs>([exec](const Call& c, const StartArgs& a) { CallExec ce{*exec, c}; return run_start(c, a, ce); }, kStartArgs(), check_start), 4000);
     shells.add("process_poll",
         "Fetch output produced by a background session SINCE THE LAST POLL, plus "
         "its status (running + uptime, or exited + exit code). Blocks briefly for "
         "new output. Reports if any output scrolled past the rolling buffer.",
-        kPollArgs.schema(), EffectSet{Effect::Exec},
-        body<PollArgs>([exec](const Call& c, const PollArgs& a) { CallExec ce{*exec, c}; return run_poll(c, a, ce); }, kPollArgs), static_cast<int>(kPollBudget));
+        kPollArgs().schema(), EffectSet{Effect::Exec},
+        body<PollArgs>([exec](const Call& c, const PollArgs& a) { CallExec ce{*exec, c}; return run_poll(c, a, ce); }, kPollArgs()), static_cast<int>(kPollBudget));
     shells.add("process_stop",
         "Terminate (SIGTERM→SIGKILL) and reap a background session, returning its "
         "exit code and any final output not yet delivered by process_poll. Always "
         "call this to clean up a session you started.",
-        kStopArgs.schema(), EffectSet{Effect::Exec},
-        body<StopArgs>([exec](const Call& c, const StopArgs& a) { CallExec ce{*exec, c}; return run_stop(c, a, ce); }, kStopArgs), static_cast<int>(kPollBudget));
+        kStopArgs().schema(), EffectSet{Effect::Exec},
+        body<StopArgs>([exec](const Call& c, const StopArgs& a) { CallExec ce{*exec, c}; return run_stop(c, a, ce); }, kStopArgs()), static_cast<int>(kPollBudget));
 }
 
 } // namespace mcp::tools::detail

@@ -230,37 +230,40 @@ struct ExtractArgs {
     std::string response_format;  // "detailed" turns on with_location
 };
 
-const util::ArgSpec<ExtractArgs> kExtractArgs{
-    util::arg(&ExtractArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&ExtractArgs::pattern, "pattern",
-              "Regex (ECMAScript) or literal selecting each match. With a regex, `group` picks which capture to emit.").required(),
-    util::arg(&ExtractArgs::root, "path",
-              "Directory to scan (default: cwd)."),
-    util::arg(&ExtractArgs::file_glob, "glob",
-              "Filter files, e.g. *.ts or src/**/*.go."),
-    util::arg(&ExtractArgs::case_sensitive, "case_sensitive",
-              "Case-sensitive match (default: false)."),
-    util::arg(&ExtractArgs::group, "group",
-              "Capture group to emit per match (0 = whole match, 1 = first group). Mutually exclusive with `column`."),
-    util::arg(&ExtractArgs::delimiter, "delimiter",
-              "Field mode (awk): split each matching line by this delimiter (\"\" = whitespace runs) and emit field `column`."),
-    util::arg(&ExtractArgs::column, "column",
-              "1-based field to emit in delimiter/awk mode. Overrides `group`."),
-    util::arg(&ExtractArgs::unique, "unique",
-              "Dedup values (first-seen order)."),
-    util::arg(&ExtractArgs::count, "count",
-              "Emit `value → occurrences` sorted desc (like sort|uniq -c)."),
-    util::arg(&ExtractArgs::sort, "sort",
-              "Sort values lexically."),
-    util::arg(&ExtractArgs::with_location, "with_location",
-              "Prefix each value with file:line (same as response_format=detailed)."),
-    util::arg(&ExtractArgs::response_format, "response_format",
-              "concise (default) = values only; detailed = each value tagged with file:line. Ask for concise unless you need provenance — it's cheaper.")
-        .suggest({"concise", "detailed"}),
-    util::arg(&ExtractArgs::limit, "limit",
-              "Max rows emitted (default 500).").range(1, 5000),
-};
+const util::ArgSpec<ExtractArgs>& kExtractArgs() {
+    static const util::ArgSpec<ExtractArgs> spec{
+        util::arg(&ExtractArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&ExtractArgs::pattern, "pattern",
+                  "Regex (ECMAScript) or literal selecting each match. With a regex, `group` picks which capture to emit.").required(),
+        util::arg(&ExtractArgs::root, "path",
+                  "Directory to scan (default: cwd)."),
+        util::arg(&ExtractArgs::file_glob, "glob",
+                  "Filter files, e.g. *.ts or src/**/*.go."),
+        util::arg(&ExtractArgs::case_sensitive, "case_sensitive",
+                  "Case-sensitive match (default: false)."),
+        util::arg(&ExtractArgs::group, "group",
+                  "Capture group to emit per match (0 = whole match, 1 = first group). Mutually exclusive with `column`."),
+        util::arg(&ExtractArgs::delimiter, "delimiter",
+                  "Field mode (awk): split each matching line by this delimiter (\"\" = whitespace runs) and emit field `column`."),
+        util::arg(&ExtractArgs::column, "column",
+                  "1-based field to emit in delimiter/awk mode. Overrides `group`."),
+        util::arg(&ExtractArgs::unique, "unique",
+                  "Dedup values (first-seen order)."),
+        util::arg(&ExtractArgs::count, "count",
+                  "Emit `value → occurrences` sorted desc (like sort|uniq -c)."),
+        util::arg(&ExtractArgs::sort, "sort",
+                  "Sort values lexically."),
+        util::arg(&ExtractArgs::with_location, "with_location",
+                  "Prefix each value with file:line (same as response_format=detailed)."),
+        util::arg(&ExtractArgs::response_format, "response_format",
+                  "concise (default) = values only; detailed = each value tagged with file:line. Ask for concise unless you need provenance — it's cheaper.")
+            .suggest({"concise", "detailed"}),
+        util::arg(&ExtractArgs::limit, "limit",
+                  "Max rows emitted (default 500).").range(1, 5000),
+    };
+    return spec;
+}
 
 // Anthropic's response_format token-economy pattern: `concise` (default)
 // emits just the values; `detailed` adds file:line provenance.
@@ -513,28 +516,31 @@ struct AggregateArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<AggregateArgs> kAggregateArgs{
-    util::arg(&AggregateArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&AggregateArgs::pattern, "pattern",
-              "Regex or literal whose matches are grouped and reduced.").required(),
-    util::arg(&AggregateArgs::root, "path",
-              "Directory to scan (default: cwd)."),
-    util::arg(&AggregateArgs::file_glob, "glob",
-              "Filter files, e.g. *.py."),
-    util::arg(&AggregateArgs::case_sensitive, "case_sensitive"),
-    util::arg(&AggregateArgs::word, "word",
-              "Whole-word match."),
-    util::arg(&AggregateArgs::by, "by",
-              "Group key: `file` (which files touch X, and how often), `match` (the whole matched text), or `capture` (a regex group — set `group`).")
-        .one_of({"file", "match", "capture"}),
-    util::arg(&AggregateArgs::group, "group",
-              "Capture group for by=capture (default 1)."),
-    util::arg(&AggregateArgs::op, "op",
-              "Reduce: `count` per group, `list` (count + up to 5 sample lines), or `sum` (parse each matched text as a number and total it).").one_of({"count", "list", "sum"}),
-    util::arg(&AggregateArgs::limit, "limit",
-              "Max groups shown (default 100).").range(1, 2000),
-};
+const util::ArgSpec<AggregateArgs>& kAggregateArgs() {
+    static const util::ArgSpec<AggregateArgs> spec{
+        util::arg(&AggregateArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&AggregateArgs::pattern, "pattern",
+                  "Regex or literal whose matches are grouped and reduced.").required(),
+        util::arg(&AggregateArgs::root, "path",
+                  "Directory to scan (default: cwd)."),
+        util::arg(&AggregateArgs::file_glob, "glob",
+                  "Filter files, e.g. *.py."),
+        util::arg(&AggregateArgs::case_sensitive, "case_sensitive"),
+        util::arg(&AggregateArgs::word, "word",
+                  "Whole-word match."),
+        util::arg(&AggregateArgs::by, "by",
+                  "Group key: `file` (which files touch X, and how often), `match` (the whole matched text), or `capture` (a regex group — set `group`).")
+            .one_of({"file", "match", "capture"}),
+        util::arg(&AggregateArgs::group, "group",
+                  "Capture group for by=capture (default 1)."),
+        util::arg(&AggregateArgs::op, "op",
+                  "Reduce: `count` per group, `list` (count + up to 5 sample lines), or `sum` (parse each matched text as a number and total it).").one_of({"count", "list", "sum"}),
+        util::arg(&AggregateArgs::limit, "limit",
+                  "Max groups shown (default 100).").range(1, 2000),
+    };
+    return spec;
+}
 
 std::expected<AggregateArgs, ToolError> check_aggregate(AggregateArgs a, const util::Bounds&) {
     if (a.root.empty()) a.root = ".";
@@ -686,27 +692,30 @@ struct ReplaceArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<ReplaceArgs> kReplaceArgs{
-    util::arg(&ReplaceArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&ReplaceArgs::find, "find",
-              "Literal text (default) or regex (regex:true) to find in every file.").required(),
-    util::arg(&ReplaceArgs::replacement, "replacement",
-              "Replacement. In regex mode, $1-$9/$& insert capture groups.")
-        .required_present("`replacement` is required"),
-    util::arg(&ReplaceArgs::root, "path",
-              "Directory to scan (default: cwd)."),
-    util::arg(&ReplaceArgs::file_glob, "glob",
-              "Filter files — STRONGLY recommended to bound the blast radius, e.g. src/**/*.ts."),
-    util::arg(&ReplaceArgs::regex, "regex",
-              "Treat `find` as an ECMAScript regex (default: literal)."),
-    util::arg(&ReplaceArgs::case_sensitive, "case_sensitive",
-              "Default true. In regex mode false adds the icase flag."),
-    util::arg(&ReplaceArgs::apply, "apply",
-              "false (default) = DRY RUN preview; true = write the files."),
-    util::arg(&ReplaceArgs::max_preview, "max_preview",
-              "Max per-file diff lines shown in the preview (default 40).").range(1, 200),
-};
+const util::ArgSpec<ReplaceArgs>& kReplaceArgs() {
+    static const util::ArgSpec<ReplaceArgs> spec{
+        util::arg(&ReplaceArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&ReplaceArgs::find, "find",
+                  "Literal text (default) or regex (regex:true) to find in every file.").required(),
+        util::arg(&ReplaceArgs::replacement, "replacement",
+                  "Replacement. In regex mode, $1-$9/$& insert capture groups.")
+            .required_present("`replacement` is required"),
+        util::arg(&ReplaceArgs::root, "path",
+                  "Directory to scan (default: cwd)."),
+        util::arg(&ReplaceArgs::file_glob, "glob",
+                  "Filter files — STRONGLY recommended to bound the blast radius, e.g. src/**/*.ts."),
+        util::arg(&ReplaceArgs::regex, "regex",
+                  "Treat `find` as an ECMAScript regex (default: literal)."),
+        util::arg(&ReplaceArgs::case_sensitive, "case_sensitive",
+                  "Default true. In regex mode false adds the icase flag."),
+        util::arg(&ReplaceArgs::apply, "apply",
+                  "false (default) = DRY RUN preview; true = write the files."),
+        util::arg(&ReplaceArgs::max_preview, "max_preview",
+                  "Max per-file diff lines shown in the preview (default 40).").range(1, 200),
+    };
+    return spec;
+}
 
 std::expected<ReplaceArgs, ToolError> check_replace(ReplaceArgs a, const util::Bounds&) {
     if (a.root.empty()) a.root = ".";
@@ -857,23 +866,26 @@ struct ReadFilterArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<ReadFilterArgs> kReadFilterArgs{
-    util::arg(&ReadFilterArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&ReadFilterArgs::path, "path",
-              "File to read.").required(),
-    util::arg(&ReadFilterArgs::pattern, "pattern",
-              "Regex or literal — only lines matching this (plus context) are emitted; the rest collapse to `⋯ N lines ⋯`.").required(),
-    util::arg(&ReadFilterArgs::case_sensitive, "case_sensitive"),
-    util::arg(&ReadFilterArgs::word, "word",
-              "Whole-word match."),
-    util::arg(&ReadFilterArgs::invert, "invert",
-              "Keep NON-matching lines instead (grep -v)."),
-    util::arg(&ReadFilterArgs::context, "context",
-              "Lines of context around each kept line (default 2, max 20).").range(0, 20),
-    util::arg(&ReadFilterArgs::max_lines, "max_lines",
-              "Cap on emitted lines (default 800).").range(1, 5000),
-};
+const util::ArgSpec<ReadFilterArgs>& kReadFilterArgs() {
+    static const util::ArgSpec<ReadFilterArgs> spec{
+        util::arg(&ReadFilterArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&ReadFilterArgs::path, "path",
+                  "File to read.").required(),
+        util::arg(&ReadFilterArgs::pattern, "pattern",
+                  "Regex or literal — only lines matching this (plus context) are emitted; the rest collapse to `⋯ N lines ⋯`.").required(),
+        util::arg(&ReadFilterArgs::case_sensitive, "case_sensitive"),
+        util::arg(&ReadFilterArgs::word, "word",
+                  "Whole-word match."),
+        util::arg(&ReadFilterArgs::invert, "invert",
+                  "Keep NON-matching lines instead (grep -v)."),
+        util::arg(&ReadFilterArgs::context, "context",
+                  "Lines of context around each kept line (default 2, max 20).").range(0, 20),
+        util::arg(&ReadFilterArgs::max_lines, "max_lines",
+                  "Cap on emitted lines (default 800).").range(1, 5000),
+    };
+    return spec;
+}
 
 ExecResult run_read_filter(const Call& call, const ReadFilterArgs& a) {
     const auto b = bounds(call);
@@ -996,8 +1008,8 @@ void register_textproc_tools(Shells& sh) {
         "value\xe2\x86\x92" "frequency (sort|uniq -c), `sort` orders them, "
         "response_format=detailed tags each with file:line. One call replaces "
         "grep\xe2\x86\x92read\xe2\x86\x92hand-aggregate.",
-        kExtractArgs.schema(), EffectSet{Effect::ReadFs},
-        body<ExtractArgs>(run_extract, kExtractArgs, check_extract), 25'000);
+        kExtractArgs().schema(), EffectSet{Effect::ReadFs},
+        body<ExtractArgs>(run_extract, kExtractArgs(), check_extract), 25'000);
 
     sh.add("aggregate",
         "USE WHEN the question is \"how many X per Y\" or \"which Y has the most "
@@ -1009,8 +1021,8 @@ void register_textproc_tools(Shells& sh) {
         "count (default), list (count + sample lines), or sum (total the matched "
         "numbers). Sorted by magnitude — dominant group first. Reach for this "
         "over grep whenever you'd otherwise count matches yourself.",
-        kAggregateArgs.schema(), EffectSet{Effect::ReadFs},
-        body<AggregateArgs>(run_aggregate, kAggregateArgs, check_aggregate), 25'000);
+        kAggregateArgs().schema(), EffectSet{Effect::ReadFs},
+        body<AggregateArgs>(run_aggregate, kAggregateArgs(), check_aggregate), 25'000);
 
     sh.add("replace",
         "RULES: DRY-RUN by default — returns a per-file before/after preview + "
@@ -1021,8 +1033,8 @@ void register_textproc_tools(Shells& sh) {
         "plain-text sibling of rewrite_structural, for renames / string swaps "
         "that aren't an AST shape. For code-shape changes (call sites, control "
         "flow) prefer rewrite_structural; for a single file prefer edit.",
-        kReplaceArgs.schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
-        body<ReplaceArgs>(run_replace, kReplaceArgs, check_replace), 25'000);
+        kReplaceArgs().schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
+        body<ReplaceArgs>(run_replace, kReplaceArgs(), check_replace), 25'000);
 
     sh.add("read_filter",
         "Read a file but keep ONLY the lines matching a pattern (plus context), "
@@ -1031,8 +1043,8 @@ void register_textproc_tools(Shells& sh) {
         "path, every `TODO`, every route registration out of a 3k-line file at a "
         "fraction of the context cost of reading it whole. `invert:true` keeps "
         "non-matching lines (grep -v); `context` sets the \xc2\xb1N window.",
-        kReadFilterArgs.schema(), EffectSet{Effect::ReadFs},
-        body<ReadFilterArgs>(run_read_filter, kReadFilterArgs), 25'000);
+        kReadFilterArgs().schema(), EffectSet{Effect::ReadFs},
+        body<ReadFilterArgs>(run_read_filter, kReadFilterArgs()), 25'000);
 }
 
 } // namespace mcp::tools::detail

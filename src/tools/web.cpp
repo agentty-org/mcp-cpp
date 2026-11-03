@@ -98,14 +98,17 @@ struct WebFetchArgs {
     json raw_headers;
 };
 
-const util::ArgSpec<WebFetchArgs> kWebFetchArgs{
-    util::arg(&WebFetchArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&WebFetchArgs::url, "url", "The URL to fetch (https only)").required(),
-    util::arg(&WebFetchArgs::method, "method", "HTTP method (default: GET)"),
-    util::arg(&WebFetchArgs::raw_headers, "headers", "Additional headers as key-value pairs")
-        .shape(json{{"type", "object"}}),
-};
+const util::ArgSpec<WebFetchArgs>& kWebFetchArgs() {
+    static const util::ArgSpec<WebFetchArgs> spec{
+        util::arg(&WebFetchArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&WebFetchArgs::url, "url", "The URL to fetch (https only)").required(),
+        util::arg(&WebFetchArgs::method, "method", "HTTP method (default: GET)"),
+        util::arg(&WebFetchArgs::raw_headers, "headers", "Additional headers as key-value pairs")
+            .shape(json{{"type", "object"}}),
+    };
+    return spec;
+}
 
 // TLS only; headers lowercased, x-no-jina pulled out; unknown method -> GET.
 std::expected<WebFetchArgs, ToolError> check_web_fetch(WebFetchArgs a, const util::Bounds&) {
@@ -1098,12 +1101,15 @@ struct WebSearchArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<WebSearchArgs> kWebSearchArgs{
-    util::arg(&WebSearchArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&WebSearchArgs::query, "query", "Search query").required(),
-    util::arg(&WebSearchArgs::count, "count", "Max results (default: 10)"),
-};
+const util::ArgSpec<WebSearchArgs>& kWebSearchArgs() {
+    static const util::ArgSpec<WebSearchArgs> spec{
+        util::arg(&WebSearchArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&WebSearchArgs::query, "query", "Search query").required(),
+        util::arg(&WebSearchArgs::count, "count", "Max results (default: 10)"),
+    };
+    return spec;
+}
 
 std::string url_unescape(std::string_view s) {
     std::string out;
@@ -1483,10 +1489,10 @@ void register_web_tools(Shells& sh, const std::shared_ptr<HttpClient>& http, boo
         "JS/SPA pages are auto-rendered via r.jina.ai when the primary "
         "fetch returns a near-empty shell (disable per-request by sending "
         "a `x-no-jina: 1` header).",
-        kWebFetchArgs.schema(), EffectSet{Effect::Net},
+        kWebFetchArgs().schema(), EffectSet{Effect::Net},
         body<WebFetchArgs>([http, jina](const WebFetchArgs& a) {
             return run_web_fetch(*http, a, jina);
-        }, kWebFetchArgs, check_web_fetch), 20'000);
+        }, kWebFetchArgs(), check_web_fetch), 20'000);
 
     sh.add("web_search",
         "Search the web. Tries the configured search services in order until one "
@@ -1495,13 +1501,13 @@ void register_web_tools(Shells& sh, const std::shared_ptr<HttpClient>& http, boo
         "to read the page. Standard search operators work in the query: "
         "`site:docs.python.org`, `\"exact phrase\"`, `-exclude`. Duplicate "
         "URLs (AMP / mobile / archive mirrors) are auto-deduped.",
-        kWebSearchArgs.schema(), EffectSet{Effect::Net},
+        kWebSearchArgs().schema(), EffectSet{Effect::Net},
         body<WebSearchArgs>([http, plans](const WebSearchArgs& a) {
             // Read the plan per call so a change in the host's settings reaches
             // the very next search. No source means the key-less default chain.
             const WebSearchPlan plan = plans ? plans->plan() : default_web_search_plan();
             return run_web_search(*http, plan, a);
-        }, kWebSearchArgs), 0);
+        }, kWebSearchArgs()), 0);
 }
 
 } // namespace mcp::tools::detail

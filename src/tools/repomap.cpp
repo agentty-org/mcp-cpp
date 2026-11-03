@@ -523,14 +523,17 @@ struct RepoMapArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<RepoMapArgs> kRepoMapArgs{
-    util::arg(&RepoMapArgs::focus, "focus", "Keywords / symbol names to personalize the ranking around (like aider's chat-file boost). Optional."),
-    util::arg(&RepoMapArgs::root, "path", "Root directory (default: workspace root)"),
-    util::arg(&RepoMapArgs::budget, "budget", "Output byte budget, 1000-60000 (default 8000 ≈ 2k tokens)")
-        .range(1000, 60000),
-    util::arg(&RepoMapArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-};
+const util::ArgSpec<RepoMapArgs>& kRepoMapArgs() {
+    static const util::ArgSpec<RepoMapArgs> spec{
+        util::arg(&RepoMapArgs::focus, "focus", "Keywords / symbol names to personalize the ranking around (like aider's chat-file boost). Optional."),
+        util::arg(&RepoMapArgs::root, "path", "Root directory (default: workspace root)"),
+        util::arg(&RepoMapArgs::budget, "budget", "Output byte budget, 1000-60000 (default 8000 ≈ 2k tokens)")
+            .range(1000, 60000),
+        util::arg(&RepoMapArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+    };
+    return spec;
+}
 
 ExecResult run_repo_map(const Call& call, RepoMapArgs a) {
     // Default to the WORKSPACE ROOT, not cwd. The tool documents "default:
@@ -686,9 +689,9 @@ void register_repo_map_tool(Shells& sh) {
         "FIRST in a large or unfamiliar repository — one call replaces a "
         "dozen exploratory read/grep rounds. Pass `focus` (task keywords or "
         "symbol names) to re-center the ranking on your task.",
-        kRepoMapArgs.schema(),
+        kRepoMapArgs().schema(),
         EffectSet{Effect::ReadFs},
-        body<RepoMapArgs>(run_repo_map, kRepoMapArgs), 60'000);
+        body<RepoMapArgs>(run_repo_map, kRepoMapArgs()), 60'000);
 }
 
 } // namespace mcp::tools::detail

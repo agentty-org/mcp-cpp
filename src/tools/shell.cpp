@@ -607,44 +607,46 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
     return ToolOutput{std::move(body), std::nullopt};
 }
 
-const util::ArgSpec<BashArgs> kBashArgs = [] {
-    util::ArgSpec<BashArgs> s{
-        util::arg(&BashArgs::display_description, "display_description",
-                  "One-line summary shown in the UI — e.g. 'Run the test suite'. "
-                  "Optional but strongly recommended."),
-        util::arg(&BashArgs::command_in, "command", "The shell command to execute")
-            .shape(json{{"type", "string"}, {"description", "The shell command to execute"}})
-            .required("command required"),
-        util::arg(&BashArgs::cd, "cd",
-                "Working directory to run the command in (a real chdir in the "
-                "child, so relative paths and the command's own $PWD are "
-                "correct). Must be an existing directory inside the workspace. "
-                "Use this instead of starting the command with `cd dir &&`."),
-        util::arg(&BashArgs::env_in, "env",
-                "Extra environment variables for THIS command, e.g. "
-                "{\"CI\":\"1\",\"RUST_LOG\":\"debug\"}. Layered on top of the "
-                "inherited environment (your values win). The tool already "
-                "forces a clean non-interactive env (NO_COLOR, PAGER=cat, "
-                "GIT_TERMINAL_PROMPT=0, TERM=dumb, …) so output is quiet and "
-                "nothing blocks on a prompt — only set this to add/override.")
-            .shape(json{{"type","object"}, {"additionalProperties", {{"type","string"}}}}),
-        util::arg(&BashArgs::timeout_in, "timeout", "Timeout in seconds (max 300). If set, the command is stopped after this long even while it's still printing. If omitted, it's stopped after 60s of silence."),
-        util::arg(&BashArgs::timeout_ms_in, "timeout_ms",
-                "Alternative timeout in milliseconds (rounded up to seconds)."),
-        util::arg(&BashArgs::head_lines, "head_lines",
-                "Return only the FIRST N lines of output to you. Use this "
-                "instead of piping to `head`: the pipe throws the rest away "
-                "before the terminal card sees it, so the user loses output "
-                "they were watching — this bounds only what reaches you, "
-                "and the card still shows everything.").range(0, 2000),
-        util::arg(&BashArgs::tail_lines, "tail_lines",
-                "Return only the LAST N lines of output to you (the usual "
-                "choice for build/test logs, where the failure is at the "
-                "end). Use this instead of piping to `tail`. Combine with "
-                "head_lines to get both ends with the middle elided.").range(0, 2000),
-    };
-    return s;
-}();
+const util::ArgSpec<BashArgs>& kBashArgs() {
+    static const util::ArgSpec<BashArgs> spec = [] {
+        util::ArgSpec<BashArgs> s{
+            util::arg(&BashArgs::display_description, "display_description",
+                      "One-line summary shown in the UI — e.g. 'Run the test suite'. "
+                      "Optional but strongly recommended."),
+            util::arg(&BashArgs::command_in, "command", "The shell command to execute")
+                .shape(json{{"type", "string"}, {"description", "The shell command to execute"}})
+                .required("command required"),
+            util::arg(&BashArgs::cd, "cd",
+                    "Working directory to run the command in (a real chdir in the "
+                    "child, so relative paths and the command's own $PWD are "
+                    "correct). Must be an existing directory inside the workspace. "
+                    "Use this instead of starting the command with `cd dir &&`."),
+            util::arg(&BashArgs::env_in, "env",
+                    "Extra environment variables for THIS command, e.g. "
+                    "{\"CI\":\"1\",\"RUST_LOG\":\"debug\"}. Layered on top of the "
+                    "inherited environment (your values win). The tool already "
+                    "forces a clean non-interactive env (NO_COLOR, PAGER=cat, "
+                    "GIT_TERMINAL_PROMPT=0, TERM=dumb, …) so output is quiet and "
+                    "nothing blocks on a prompt — only set this to add/override.")
+                .shape(json{{"type","object"}, {"additionalProperties", {{"type","string"}}}}),
+            util::arg(&BashArgs::timeout_in, "timeout", "Timeout in seconds (max 300). If set, the command is stopped after this long even while it's still printing. If omitted, it's stopped after 60s of silence."),
+            util::arg(&BashArgs::timeout_ms_in, "timeout_ms",
+                    "Alternative timeout in milliseconds (rounded up to seconds)."),
+            util::arg(&BashArgs::head_lines, "head_lines",
+                    "Return only the FIRST N lines of output to you. Use this "
+                    "instead of piping to `head`: the pipe throws the rest away "
+                    "before the terminal card sees it, so the user loses output "
+                    "they were watching — this bounds only what reaches you, "
+                    "and the card still shows everything.").range(0, 2000),
+            util::arg(&BashArgs::tail_lines, "tail_lines",
+                    "Return only the LAST N lines of output to you (the usual "
+                    "choice for build/test logs, where the failure is at the "
+                    "end). Use this instead of piping to `tail`. Combine with "
+                    "head_lines to get both ends with the middle elided.").range(0, 2000),
+        };
+        return s;}();
+    return spec;
+}
 
 } // namespace
 
@@ -665,12 +667,12 @@ void register_shell_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "Linux and macOS), not bash — keep commands portable and avoid "
         "bashisms. Output is truncated at 30k chars.",
 #endif
-        kBashArgs.schema(), EffectSet{Effect::Exec},
+        kBashArgs().schema(), EffectSet{Effect::Exec},
         body<BashArgs>([exec](const Call& c, const BashArgs& a) {
                 CallExec ce{*exec, c};
                 return run_bash(a, ce);
             },
-                       kBashArgs, check_bash_args), 30'000);
+                       kBashArgs(), check_bash_args), 30'000);
 }
 
 } // namespace mcp::tools::detail

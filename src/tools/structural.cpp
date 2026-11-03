@@ -281,32 +281,35 @@ struct StructArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<StructArgs> kStructArgs{
-    util::arg(&StructArgs::pattern, "pattern",
-              "A code SHAPE to match on a nested-document model (like "
-              "Semgrep generic / ast-grep), tokenized language-aware so it "
-              "NEVER matches inside comments or string literals. "
-              "Metavariables: $NAME matches exactly ONE node — one "
-              "identifier/literal OR one balanced (…)/[…]/{…} group — and "
-              "binds it (reuse $NAME to require the same text); $$$NAME "
-              "matches a run of ZERO OR MORE nodes (e.g. an argument list or "
-              "a multi-token condition). $_ / $$$ are anonymous. So "
-              "`malloc($N)` matches malloc(n) but NOT malloc(a*b) (2 nodes) "
-              "— use `malloc($$$)` for that. Examples: 'foo($$$)' finds every "
-              "foo call; 'if ($$$C) return $X;' finds guarded returns; "
-              "'$X == $X' finds self-comparisons; 'catch ($$$) {}' finds "
-              "empty catch blocks. Nested calls match too (the matcher "
-              "recurses into groups).").required(),
-    util::arg(&StructArgs::root, "path", "Directory to search (default: workspace root)."),
-    util::arg(&StructArgs::glob, "glob", "Optional filename glob filter, e.g. '*.ts'."),
-    util::arg(&StructArgs::expand, "expand",
-              "When true, return the WHOLE enclosing function/block "
-              "around each match instead of ±1 context line — so the "
-              "result is self-sufficient and you rarely need a "
-              "follow-up `read`. Default false."),
-    util::arg(&StructArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-};
+const util::ArgSpec<StructArgs>& kStructArgs() {
+    static const util::ArgSpec<StructArgs> spec{
+        util::arg(&StructArgs::pattern, "pattern",
+                  "A code SHAPE to match on a nested-document model (like "
+                  "Semgrep generic / ast-grep), tokenized language-aware so it "
+                  "NEVER matches inside comments or string literals. "
+                  "Metavariables: $NAME matches exactly ONE node — one "
+                  "identifier/literal OR one balanced (…)/[…]/{…} group — and "
+                  "binds it (reuse $NAME to require the same text); $$$NAME "
+                  "matches a run of ZERO OR MORE nodes (e.g. an argument list or "
+                  "a multi-token condition). $_ / $$$ are anonymous. So "
+                  "`malloc($N)` matches malloc(n) but NOT malloc(a*b) (2 nodes) "
+                  "— use `malloc($$$)` for that. Examples: 'foo($$$)' finds every "
+                  "foo call; 'if ($$$C) return $X;' finds guarded returns; "
+                  "'$X == $X' finds self-comparisons; 'catch ($$$) {}' finds "
+                  "empty catch blocks. Nested calls match too (the matcher "
+                  "recurses into groups).").required(),
+        util::arg(&StructArgs::root, "path", "Directory to search (default: workspace root)."),
+        util::arg(&StructArgs::glob, "glob", "Optional filename glob filter, e.g. '*.ts'."),
+        util::arg(&StructArgs::expand, "expand",
+                  "When true, return the WHOLE enclosing function/block "
+                  "around each match instead of ±1 context line — so the "
+                  "result is self-sufficient and you rarely need a "
+                  "follow-up `read`. Default false."),
+        util::arg(&StructArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+    };
+    return spec;
+}
 
 [[nodiscard]] bool is_blank(std::string_view s) noexcept {
     return s.find_first_not_of(" \t\r\n") == std::string_view::npos;
@@ -766,28 +769,31 @@ void pattern_vars(const std::vector<PNode>& pat, std::vector<std::string>& out) 
     }
 }
 
-const util::ArgSpec<RewriteArgs> kRewriteArgs{
-    util::arg(&RewriteArgs::pattern, "pattern",
-              "The code SHAPE to find — same language as search_structural "
-              "($NAME binds one node, $$$NAME binds a run, back-refs must "
-              "match). Every match's exact byte span is replaced.").required(),
-    util::arg(&RewriteArgs::rewrite, "rewrite",
-              "Replacement template. $NAME / $$$NAME splice the VERBATIM "
-              "source bytes that metavariable captured (original spacing "
-              "kept). Example: pattern 'assertEquals($A, $B)' rewrite "
-              "'assertEqual($B, $A)' swaps the arguments at every call "
-              "site. Every $NAME in the template must be bound by the "
-              "pattern.").required(),
-    util::arg(&RewriteArgs::root, "path", "Directory to rewrite under (default: workspace root)."),
-    util::arg(&RewriteArgs::glob, "glob", "Optional filename glob filter, e.g. '*.py'."),
-    util::arg(&RewriteArgs::apply, "apply",
-              "false (default) = DRY RUN: show every before/after "
-              "pair without touching disk. true = write the files "
-              "(atomic per file). ALWAYS dry-run first and read the "
-              "preview before applying."),
-    util::arg(&RewriteArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-};
+const util::ArgSpec<RewriteArgs>& kRewriteArgs() {
+    static const util::ArgSpec<RewriteArgs> spec{
+        util::arg(&RewriteArgs::pattern, "pattern",
+                  "The code SHAPE to find — same language as search_structural "
+                  "($NAME binds one node, $$$NAME binds a run, back-refs must "
+                  "match). Every match's exact byte span is replaced.").required(),
+        util::arg(&RewriteArgs::rewrite, "rewrite",
+                  "Replacement template. $NAME / $$$NAME splice the VERBATIM "
+                  "source bytes that metavariable captured (original spacing "
+                  "kept). Example: pattern 'assertEquals($A, $B)' rewrite "
+                  "'assertEqual($B, $A)' swaps the arguments at every call "
+                  "site. Every $NAME in the template must be bound by the "
+                  "pattern.").required(),
+        util::arg(&RewriteArgs::root, "path", "Directory to rewrite under (default: workspace root)."),
+        util::arg(&RewriteArgs::glob, "glob", "Optional filename glob filter, e.g. '*.py'."),
+        util::arg(&RewriteArgs::apply, "apply",
+                  "false (default) = DRY RUN: show every before/after "
+                  "pair without touching disk. true = write the files "
+                  "(atomic per file). ALWAYS dry-run first and read the "
+                  "preview before applying."),
+        util::arg(&RewriteArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+    };
+    return spec;
+}
 
 std::expected<RewriteArgs, ToolError> check_rewrite(RewriteArgs a, const util::Bounds&) {
     if (is_blank(a.pattern))
@@ -982,11 +988,11 @@ void register_structural_tools(Shells& sh,
            "`search_code`. When the code index is available, zero hits come "
            "back with semantically-nearest leads (verified against disk), and "
            "over-budget result sets render the most task-relevant files first.",
-           kStructArgs.schema(),
+           kStructArgs().schema(),
            EffectSet{Effect::ReadFs},
            body<StructArgs>([sem](const Call& c, const StructArgs& a) {
                return run_structural(c, a, sem.get());
-           }, kStructArgs, check_struct),
+           }, kStructArgs(), check_struct),
            /*token_budget=*/30'000);
 
     sh.add("rewrite_structural",
@@ -1002,9 +1008,9 @@ void register_structural_tools(Shells& sh,
            "preview of every before/after pair; re-run with apply:true to "
            "write. Use `edit` for one-off changes; use THIS for the same "
            "shape change across many sites.",
-           kRewriteArgs.schema(),
+           kRewriteArgs().schema(),
            EffectSet{Effect::ReadFs, Effect::WriteFs},
-           body<RewriteArgs>(run_rewrite, kRewriteArgs, check_rewrite),
+           body<RewriteArgs>(run_rewrite, kRewriteArgs(), check_rewrite),
            /*token_budget=*/30'000);
 }
 

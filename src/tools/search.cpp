@@ -57,12 +57,15 @@ struct GlobArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<GlobArgs> kGlobArgs{
-    util::arg(&GlobArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&GlobArgs::pattern, "pattern", "Glob pattern, e.g. *.cpp").required(),
-    util::arg(&GlobArgs::root, "path", "Root directory (default: cwd)"),
-};
+const util::ArgSpec<GlobArgs>& kGlobArgs() {
+    static const util::ArgSpec<GlobArgs> spec{
+        util::arg(&GlobArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&GlobArgs::pattern, "pattern", "Glob pattern, e.g. *.cpp").required(),
+        util::arg(&GlobArgs::root, "path", "Root directory (default: cwd)"),
+    };
+    return spec;
+}
 
 [[nodiscard]] bool is_blank(std::string_view s) noexcept {
     return s.find_first_not_of(" \t\r\n") == std::string_view::npos;
@@ -182,12 +185,15 @@ struct FindDefinitionArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<FindDefinitionArgs> kFindDefinitionArgs{
-    util::arg(&FindDefinitionArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&FindDefinitionArgs::symbol, "symbol", "The symbol name to find").required(),
-    util::arg(&FindDefinitionArgs::root, "path", "Directory to search (default: cwd)"),
-};
+const util::ArgSpec<FindDefinitionArgs>& kFindDefinitionArgs() {
+    static const util::ArgSpec<FindDefinitionArgs> spec{
+        util::arg(&FindDefinitionArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&FindDefinitionArgs::symbol, "symbol", "The symbol name to find").required(),
+        util::arg(&FindDefinitionArgs::root, "path", "Directory to search (default: cwd)"),
+    };
+    return spec;
+}
 
 // A symbol is a name, maybe qualified (ns::name, obj.name). Checked here so
 // it can't reach the regexes below as something else: a 200 KB "symbol"
@@ -437,20 +443,23 @@ std::string literal_alternation(std::string_view p) {
     return out;
 }
 
-const util::ArgSpec<GrepArgs> kGrepArgs{
-    util::arg(&GrepArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&GrepArgs::pattern, "pattern", "Regex pattern to search for").required(),
-    util::arg(&GrepArgs::root, "path", "Directory to search (default: cwd)"),
-    util::arg(&GrepArgs::file_glob, "glob", "Filter files by glob. A bare pattern like `*.cpp` matches the filename anywhere; a slash pattern like `src/*.ts` or `**/test/*.py` matches the workspace-relative path."),
-    util::arg(&GrepArgs::case_sensitive, "case_sensitive", "Case-sensitive match (default: false)"),
-    util::arg(&GrepArgs::word, "word", "Whole-word match: `foo` won't match `foobar` or `do_foo`. Use for finding all USES of an identifier."),
-    util::arg(&GrepArgs::context_arg, "context", "`line` (default) = ±2 lines around each hit. `block` = the WHOLE enclosing function/block, so you rarely need a follow-up `read`. A number `0`-`60` = ±N lines (like grep -C N) (use `0` for match lines only — densest content view)."),
-    util::arg(&GrepArgs::output_arg, "output", "`content` (default) = matching lines with context. `files` = one path + match-count per line, no line bodies (the survey view: WHICH files touch X). `count` = per-file match counts only (the cheapest probe: HOW WIDESPREAD is X — run this before a bulk rewrite).").suggest({"content", "files", "count"}),
-    util::arg(&GrepArgs::offset, "offset", "Skip this many matches (for pagination)"),
-    util::arg(&GrepArgs::per_page, "limit", "Matches per page (default 20, max 200). Use this instead of piping to `head`.").range(1, kMaxPage),
-    util::arg(&GrepArgs::exclude, "exclude", "Drop hits whose line matches this regex (ECMAScript). Use this instead of piping to `grep -v`."),
-};
+const util::ArgSpec<GrepArgs>& kGrepArgs() {
+    static const util::ArgSpec<GrepArgs> spec{
+        util::arg(&GrepArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&GrepArgs::pattern, "pattern", "Regex pattern to search for").required(),
+        util::arg(&GrepArgs::root, "path", "Directory to search (default: cwd)"),
+        util::arg(&GrepArgs::file_glob, "glob", "Filter files by glob. A bare pattern like `*.cpp` matches the filename anywhere; a slash pattern like `src/*.ts` or `**/test/*.py` matches the workspace-relative path."),
+        util::arg(&GrepArgs::case_sensitive, "case_sensitive", "Case-sensitive match (default: false)"),
+        util::arg(&GrepArgs::word, "word", "Whole-word match: `foo` won't match `foobar` or `do_foo`. Use for finding all USES of an identifier."),
+        util::arg(&GrepArgs::context_arg, "context", "`line` (default) = ±2 lines around each hit. `block` = the WHOLE enclosing function/block, so you rarely need a follow-up `read`. A number `0`-`60` = ±N lines (like grep -C N) (use `0` for match lines only — densest content view)."),
+        util::arg(&GrepArgs::output_arg, "output", "`content` (default) = matching lines with context. `files` = one path + match-count per line, no line bodies (the survey view: WHICH files touch X). `count` = per-file match counts only (the cheapest probe: HOW WIDESPREAD is X — run this before a bulk rewrite).").suggest({"content", "files", "count"}),
+        util::arg(&GrepArgs::offset, "offset", "Skip this many matches (for pagination)"),
+        util::arg(&GrepArgs::per_page, "limit", "Matches per page (default 20, max 200). Use this instead of piping to `head`.").range(1, kMaxPage),
+        util::arg(&GrepArgs::exclude, "exclude", "Drop hits whose line matches this regex (ECMAScript). Use this instead of piping to `grep -v`."),
+    };
+    return spec;
+}
 
 // `context` is "block", a number ("5" or a bare 5, which decodes as "5") or
 // the default; an unknown `output` falls back to content, as before.
@@ -1601,8 +1610,8 @@ void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "function/class when detectable (e.g. `### fn foo \xe2\x80\xba L12-14`). "
         "Paginated 20 results per page (`limit` changes that). Case-insensitive by default; pass "
         "case_sensitive=true for exact case. Use offset for subsequent pages.",
-        kGrepArgs.schema(), EffectSet{Effect::ReadFs},
-        body<GrepArgs>([exec](const Call& c, const GrepArgs& a) { return run_grep(c, a, exec.get()); }, kGrepArgs, check_grep), 30'000);
+        kGrepArgs().schema(), EffectSet{Effect::ReadFs},
+        body<GrepArgs>([exec](const Call& c, const GrepArgs& a) { return run_grep(c, a, exec.get()); }, kGrepArgs(), check_grep), 30'000);
 
     sh.add("glob",
         "Find files by glob pattern. Supports `*` (any run), `?` (one char), "
@@ -1610,8 +1619,8 @@ void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "the FILENAME anywhere in the tree (`*.cpp`); a pattern containing a "
         "slash matches the workspace-relative PATH (`src/*.ts`, `**/util/*.hpp`). "
         "Case-insensitive on Windows.",
-        kGlobArgs.schema(), EffectSet{Effect::ReadFs},
-        body<GlobArgs>(run_glob, kGlobArgs, check_glob), 25'000);
+        kGlobArgs().schema(), EffectSet{Effect::ReadFs},
+        body<GlobArgs>(run_glob, kGlobArgs(), check_glob), 25'000);
 
     if (!exec) return;   // find_definition runs ripgrep
     sh.add("find_definition",
@@ -1621,8 +1630,8 @@ void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "it returns the declaration, not a ranked overview (that's `repo_map`). "
         "To find USES of a symbol, use `grep` with word=true; for calls with a "
         "specific shape use `search_structural`.",
-        kFindDefinitionArgs.schema(), EffectSet{Effect::ReadFs},
-        body<FindDefinitionArgs>([exec](const Call& c, const FindDefinitionArgs& a) { CallExec ce{*exec, c}; return run_find_definition(c, a, ce); }, kFindDefinitionArgs, check_find_definition_args), 25'000);
+        kFindDefinitionArgs().schema(), EffectSet{Effect::ReadFs},
+        body<FindDefinitionArgs>([exec](const Call& c, const FindDefinitionArgs& a) { CallExec ce{*exec, c}; return run_find_definition(c, a, ce); }, kFindDefinitionArgs(), check_find_definition_args), 25'000);
 }
 
 } // namespace mcp::tools::detail

@@ -323,19 +323,21 @@ std::expected<ReadArgs, ToolError> check_read_args(ReadArgs a, const util::Bound
     return a;
 }
 
-const util::ArgSpec<ReadArgs> kReadArgs = [] {
-    util::ArgSpec<ReadArgs> s{
-        util::arg(&ReadArgs::display_description, "display_description",
-                  "One-line summary shown in the UI. Optional."),
-        util::arg(&ReadArgs::raw_path, "path", "Absolute or relative path").advertise_required(),
-        util::arg(&ReadArgs::symbol, "symbol", "Read ONLY this symbol's definition + body (function/class/etc.), resolved to its enclosing block — no line numbers or `sed` needed. e.g. symbol=\"parse_args\"."),
-        util::arg(&ReadArgs::offset_in, "offset", "Start line (1-based). NEGATIVE = tail: offset:-50 returns the LAST 50 lines (like tail -n 50) — ideal for logs and build output, no need to know the file length."),
-        util::arg(&ReadArgs::limit_in, "limit", "Max lines"),
-        util::arg(&ReadArgs::end_line, "end_line", "Inclusive last line (Zed-style)"),
-    };
-    s.tidy(&tidy_read_args).raw(&ReadArgs::raw);
-    return s;
-}();
+const util::ArgSpec<ReadArgs>& kReadArgs() {
+    static const util::ArgSpec<ReadArgs> spec = [] {
+        util::ArgSpec<ReadArgs> s{
+            util::arg(&ReadArgs::display_description, "display_description",
+                      "One-line summary shown in the UI. Optional."),
+            util::arg(&ReadArgs::raw_path, "path", "Absolute or relative path").advertise_required(),
+            util::arg(&ReadArgs::symbol, "symbol", "Read ONLY this symbol's definition + body (function/class/etc.), resolved to its enclosing block — no line numbers or `sed` needed. e.g. symbol=\"parse_args\"."),
+            util::arg(&ReadArgs::offset_in, "offset", "Start line (1-based). NEGATIVE = tail: offset:-50 returns the LAST 50 lines (like tail -n 50) — ideal for logs and build output, no need to know the file length."),
+            util::arg(&ReadArgs::limit_in, "limit", "Max lines"),
+            util::arg(&ReadArgs::end_line, "end_line", "Inclusive last line (Zed-style)"),
+        };
+        s.tidy(&tidy_read_args).raw(&ReadArgs::raw);
+        return s;}();
+    return spec;
+}
 
 ExecResult run_read(const Call& call, const ReadArgs& a) {
     const auto& p = a.path->path();
@@ -898,20 +900,22 @@ std::expected<WriteArgs, ToolError> check_write_args(WriteArgs a, const util::Bo
     return a;
 }
 
-const util::ArgSpec<WriteArgs> kWriteArgs = [] {
-    util::ArgSpec<WriteArgs> s{
-        util::arg(&WriteArgs::display_description, "display_description",
-                  "One-line summary shown in the UI. Optional."),
-        util::arg(&WriteArgs::raw_path, "file_path",
-                  "The absolute path to the file to write (must be absolute, not relative).")
-            .required("path required (received keys: {keys})"),
-        // check_write_args rescues a body sent under another key.
-        util::arg(&WriteArgs::content, "content", "The content to write to the file.")
-            .advertise_required(),
-    };
-    s.raw(&WriteArgs::raw);
-    return s;
-}();
+const util::ArgSpec<WriteArgs>& kWriteArgs() {
+    static const util::ArgSpec<WriteArgs> spec = [] {
+        util::ArgSpec<WriteArgs> s{
+            util::arg(&WriteArgs::display_description, "display_description",
+                      "One-line summary shown in the UI. Optional."),
+            util::arg(&WriteArgs::raw_path, "file_path",
+                      "The absolute path to the file to write (must be absolute, not relative).")
+                .required("path required (received keys: {keys})"),
+            // check_write_args rescues a body sent under another key.
+            util::arg(&WriteArgs::content, "content", "The content to write to the file.")
+                .advertise_required(),
+        };
+        s.raw(&WriteArgs::raw);
+        return s;}();
+    return spec;
+}
 
 ExecResult run_write(const Call& call, const WriteArgs& a) {
     const auto& p = a.path->path();
@@ -1032,13 +1036,16 @@ struct ListDirArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<ListDirArgs> kListDirArgs{
-    util::arg(&ListDirArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&ListDirArgs::root, "path", "Directory to list (default: cwd)"),
-    util::arg(&ListDirArgs::recursive, "recursive", "List recursively"),
-    util::arg(&ListDirArgs::max_depth, "max_depth", "Max depth for recursive listing").range(1, 16),
-};
+const util::ArgSpec<ListDirArgs>& kListDirArgs() {
+    static const util::ArgSpec<ListDirArgs> spec{
+        util::arg(&ListDirArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&ListDirArgs::root, "path", "Directory to list (default: cwd)"),
+        util::arg(&ListDirArgs::recursive, "recursive", "List recursively"),
+        util::arg(&ListDirArgs::max_depth, "max_depth", "Max depth for recursive listing").range(1, 16),
+    };
+    return spec;
+}
 
 ExecResult run_list_dir(const Call& call, const ListDirArgs& a) {
     auto wp = util::make_workspace_path_checked(a.root, "list_dir", bounds(call));
@@ -1120,12 +1127,15 @@ ExecResult run_list_dir(const Call& call, const ListDirArgs& a) {
 struct MoveArgs { std::string raw_source; std::string raw_destination; bool overwrite = false;
                   fs::path source; fs::path destination; };
 
-const util::ArgSpec<MoveArgs> kMoveArgs{
-    util::arg(&MoveArgs::raw_source, "source", "Workspace-relative or absolute source path.").required(),
-    util::arg(&MoveArgs::raw_destination, "destination",
-              "Workspace-relative or absolute destination path.").required(),
-    util::arg(&MoveArgs::overwrite, "overwrite", "Replace an existing destination."),
-};
+const util::ArgSpec<MoveArgs>& kMoveArgs() {
+    static const util::ArgSpec<MoveArgs> spec{
+        util::arg(&MoveArgs::raw_source, "source", "Workspace-relative or absolute source path.").required(),
+        util::arg(&MoveArgs::raw_destination, "destination",
+                  "Workspace-relative or absolute destination path.").required(),
+        util::arg(&MoveArgs::overwrite, "overwrite", "Replace an existing destination."),
+    };
+    return spec;
+}
 
 std::expected<MoveArgs, ToolError> check_move_args(MoveArgs a, const util::Bounds& b) {
     auto src = util::make_workspace_path_checked(a.raw_source, "move", b);
@@ -1200,10 +1210,13 @@ ExecResult run_move(const Call& call, const MoveArgs& a) {
 
 struct RemoveArgs { std::string raw; bool recursive = false; fs::path path; };
 
-const util::ArgSpec<RemoveArgs> kRemoveArgs{
-    util::arg(&RemoveArgs::raw, "path", "Workspace path to remove.").required(),
-    util::arg(&RemoveArgs::recursive, "recursive", "Required for non-empty directories."),
-};
+const util::ArgSpec<RemoveArgs>& kRemoveArgs() {
+    static const util::ArgSpec<RemoveArgs> spec{
+        util::arg(&RemoveArgs::raw, "path", "Workspace path to remove.").required(),
+        util::arg(&RemoveArgs::recursive, "recursive", "Required for non-empty directories."),
+    };
+    return spec;
+}
 
 std::expected<RemoveArgs, ToolError> check_remove_args(RemoveArgs a, const util::Bounds& b) {
     auto checked = util::make_workspace_path_checked(a.raw, "remove", b);
@@ -1310,16 +1323,18 @@ std::expected<OutlineArgs, ToolError> check_outline_args(OutlineArgs a, const ut
     return a;
 }
 
-const util::ArgSpec<OutlineArgs> kOutlineArgs = [] {
-    util::ArgSpec<OutlineArgs> s{
-        util::arg(&OutlineArgs::raw_path, "path", "File to outline.").required("`path` is required"),
-        util::arg(&OutlineArgs::display_description, "display_description",
-                  "One-line summary shown in the UI. Optional."),
-        util::arg(&OutlineArgs::max_entries, "max_entries", "Max symbols shown (default 400).")
-            .range(1, 2000),
-    };
-    return s;
-}();
+const util::ArgSpec<OutlineArgs>& kOutlineArgs() {
+    static const util::ArgSpec<OutlineArgs> spec = [] {
+        util::ArgSpec<OutlineArgs> s{
+            util::arg(&OutlineArgs::raw_path, "path", "File to outline.").required("`path` is required"),
+            util::arg(&OutlineArgs::display_description, "display_description",
+                      "One-line summary shown in the UI. Optional."),
+            util::arg(&OutlineArgs::max_entries, "max_entries", "Max symbols shown (default 400).")
+                .range(1, 2000),
+        };
+        return s;}();
+    return spec;
+}
 
 void register_fs_tools(Shells& sh) {
     sh.add("read",
@@ -1343,8 +1358,8 @@ void register_fs_tools(Shells& sh) {
         " Each output line starts with its line number right-aligned in 6 "
         "columns and a tab (like `cat -n`); that prefix is not file content, "
         "so never copy it into an edit's old_text or new_text.",
-        kReadArgs.schema(), EffectSet{Effect::ReadFs},
-        body<ReadArgs>(run_read, kReadArgs, check_read_args), 80'000);
+        kReadArgs().schema(), EffectSet{Effect::ReadFs},
+        body<ReadArgs>(run_read, kReadArgs(), check_read_args), 80'000);
 
     sh.add("write",
         "Writes a file to the local filesystem.\n\n"
@@ -1356,13 +1371,13 @@ void register_fs_tools(Shells& sh) {
         "- Prefer the Edit tool for modifying existing files — it only sends "
         "the diff. Only use this tool to create new files or for complete "
         "rewrites.",
-        kWriteArgs.schema(), EffectSet{Effect::WriteFs},
-        body<WriteArgs>(run_write, kWriteArgs, check_write_args), 40'000);
+        kWriteArgs().schema(), EffectSet{Effect::WriteFs},
+        body<WriteArgs>(run_write, kWriteArgs(), check_write_args), 40'000);
 
     sh.add("list_dir",
         "List the contents of a directory. Shows file type, size, and name.",
-        kListDirArgs.schema(), EffectSet{Effect::ReadFs},
-        body<ListDirArgs>(run_list_dir, kListDirArgs), 25'000);
+        kListDirArgs().schema(), EffectSet{Effect::ReadFs},
+        body<ListDirArgs>(run_list_dir, kListDirArgs()), 25'000);
 
     sh.add("outline",
         "Show a file's SHAPE \xe2\x80\x94 a nested tree of its definitions "
@@ -1372,20 +1387,20 @@ void register_fs_tools(Shells& sh) {
         "then jump to a symbol with read(symbol=) or read(offset=). Unlike "
         "read's size-triggered outline, this works at any size and nests "
         "methods under their class by indent depth.",
-        kOutlineArgs.schema(), EffectSet{Effect::ReadFs},
-        body<OutlineArgs>(run_outline, kOutlineArgs, check_outline_args), 25'000);
+        kOutlineArgs().schema(), EffectSet{Effect::ReadFs},
+        body<OutlineArgs>(run_outline, kOutlineArgs(), check_outline_args), 25'000);
 
     sh.add("move",
         "Move or rename a file or directory within the workspace without invoking a shell. "
         "The destination is never overwritten unless overwrite:true is explicit.",
-        kMoveArgs.schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
-        body<MoveArgs>(run_move, kMoveArgs, check_move_args), 4'000);
+        kMoveArgs().schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
+        body<MoveArgs>(run_move, kMoveArgs(), check_move_args), 4'000);
 
     sh.add("remove",
         "Remove a file or directory within the workspace without invoking a shell. "
         "Non-empty directories require recursive:true; the workspace root is always refused.",
-        kRemoveArgs.schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
-        body<RemoveArgs>(run_remove, kRemoveArgs, check_remove_args), 4'000);
+        kRemoveArgs().schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
+        body<RemoveArgs>(run_remove, kRemoveArgs(), check_remove_args), 4'000);
 
     // edit (own TU — fuzzy splice logic is large)
     register_edit_tool(sh);

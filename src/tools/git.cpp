@@ -454,11 +454,14 @@ struct GitStatusArgs {
 // the smart default (the process cwd / the project). A literal "." is
 // workspace-checked into the access boundary, which under `--workspace /`
 // becomes `/` and makes `git -C / status` fail "not a git repository".
-const util::ArgSpec<GitStatusArgs> kGitStatusArgs{
-    util::arg(&GitStatusArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&GitStatusArgs::root, "path", "Repository path (default: cwd)"),
-};
+const util::ArgSpec<GitStatusArgs>& kGitStatusArgs() {
+    static const util::ArgSpec<GitStatusArgs> spec{
+        util::arg(&GitStatusArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&GitStatusArgs::root, "path", "Repository path (default: cwd)"),
+    };
+    return spec;
+}
 
 ExecResult run_git_status(const Call& call, const GitStatusArgs& a, CallExec& exec) {
     const auto b = bounds(call);
@@ -531,17 +534,20 @@ struct GitDiffArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<GitDiffArgs> kGitDiffArgs{
-    util::arg(&GitDiffArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&GitDiffArgs::path, "path", "File or directory to diff"),
-    util::arg(&GitDiffArgs::staged, "staged", "Show staged changes (default: false)"),
-    util::arg(&GitDiffArgs::ref, "ref", "Git ref or range (e.g. HEAD~3, main..HEAD)"),
-    util::arg(&GitDiffArgs::stat_only, "stat_only", "Only the per-file "
-              "change summary, no patch body — cheap for large diffs (default: false)"),
-    util::arg(&GitDiffArgs::context, "context", "Lines of context "
-              "around each hunk (default: 3, 0–100)").range(0, 100),
-};
+const util::ArgSpec<GitDiffArgs>& kGitDiffArgs() {
+    static const util::ArgSpec<GitDiffArgs> spec{
+        util::arg(&GitDiffArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&GitDiffArgs::path, "path", "File or directory to diff"),
+        util::arg(&GitDiffArgs::staged, "staged", "Show staged changes (default: false)"),
+        util::arg(&GitDiffArgs::ref, "ref", "Git ref or range (e.g. HEAD~3, main..HEAD)"),
+        util::arg(&GitDiffArgs::stat_only, "stat_only", "Only the per-file "
+                  "change summary, no patch body — cheap for large diffs (default: false)"),
+        util::arg(&GitDiffArgs::context, "context", "Lines of context "
+                  "around each hunk (default: 3, 0–100)").range(0, 100),
+    };
+    return spec;
+}
 
 ExecResult run_git_diff(const Call& call, const GitDiffArgs& a, CallExec& exec) {
     const auto b = bounds(call);
@@ -621,14 +627,17 @@ struct GitLogArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<GitLogArgs> kGitLogArgs{
-    util::arg(&GitLogArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&GitLogArgs::count, "count", "Number of commits (default: 20)"),
-    util::arg(&GitLogArgs::path, "path", "Filter by file path"),
-    util::arg(&GitLogArgs::ref, "ref", "Branch or ref (default: HEAD)"),
-    util::arg(&GitLogArgs::oneline, "oneline", "One-line format (default: false)"),
-};
+const util::ArgSpec<GitLogArgs>& kGitLogArgs() {
+    static const util::ArgSpec<GitLogArgs> spec{
+        util::arg(&GitLogArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&GitLogArgs::count, "count", "Number of commits (default: 20)"),
+        util::arg(&GitLogArgs::path, "path", "Filter by file path"),
+        util::arg(&GitLogArgs::ref, "ref", "Branch or ref (default: HEAD)"),
+        util::arg(&GitLogArgs::oneline, "oneline", "One-line format (default: false)"),
+    };
+    return spec;
+}
 
 ExecResult run_git_log(const Call& call, const GitLogArgs& a, CallExec& exec) {
     const auto b = bounds(call);
@@ -679,18 +688,21 @@ struct GitCommitArgs {
     std::optional<std::string> raw_message;
 };
 
-const util::ArgSpec<GitCommitArgs> kGitCommitArgs{
-    util::arg(&GitCommitArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&GitCommitArgs::raw_message, "message", "Commit message "
-              "(required unless amend=true, where it defaults to the existing message)"),
-    util::arg(&GitCommitArgs::files, "files", "Files to stage before committing"),
-    util::arg(&GitCommitArgs::stage_all, "stage_all", "Stage all changes (default: false)"),
-    util::arg(&GitCommitArgs::amend, "amend", "Amend the previous "
-              "commit instead of creating a new one; omit message to keep it (default: false)"),
-    util::arg(&GitCommitArgs::path, "path", "Repository path "
-              "(default: derived from files, else the current project)"),
-};
+const util::ArgSpec<GitCommitArgs>& kGitCommitArgs() {
+    static const util::ArgSpec<GitCommitArgs> spec{
+        util::arg(&GitCommitArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&GitCommitArgs::raw_message, "message", "Commit message "
+                  "(required unless amend=true, where it defaults to the existing message)"),
+        util::arg(&GitCommitArgs::files, "files", "Files to stage before committing"),
+        util::arg(&GitCommitArgs::stage_all, "stage_all", "Stage all changes (default: false)"),
+        util::arg(&GitCommitArgs::amend, "amend", "Amend the previous "
+                  "commit instead of creating a new one; omit message to keep it (default: false)"),
+        util::arg(&GitCommitArgs::path, "path", "Repository path "
+                  "(default: derived from files, else the current project)"),
+    };
+    return spec;
+}
 
 // Message trimmed and required unless amending; files keeps non-empty strings.
 std::expected<GitCommitArgs, ToolError> check_git_commit(GitCommitArgs a, const util::Bounds&) {
@@ -861,13 +873,16 @@ struct GitShowArgs {
     std::string format = "commit";
 };
 
-const util::ArgSpec<GitShowArgs> kGitShowArgs{
-    util::arg(&GitShowArgs::ref, "ref", "Commit/ref (default HEAD)."),
-    util::arg(&GitShowArgs::path, "path", "Optional workspace file/path filter."),
-    util::arg(&GitShowArgs::format, "format",
-              "commit shows metadata+patch; file shows file contents at ref.")
-        .one_of({"commit", "file"}),
-};
+const util::ArgSpec<GitShowArgs>& kGitShowArgs() {
+    static const util::ArgSpec<GitShowArgs> spec{
+        util::arg(&GitShowArgs::ref, "ref", "Commit/ref (default HEAD)."),
+        util::arg(&GitShowArgs::path, "path", "Optional workspace file/path filter."),
+        util::arg(&GitShowArgs::format, "format",
+                  "commit shows metadata+patch; file shows file contents at ref.")
+            .one_of({"commit", "file"}),
+    };
+    return spec;
+}
 
 // format=file needs a path.
 std::expected<GitShowArgs, ToolError> check_git_show(GitShowArgs a, const util::Bounds&) {
@@ -911,12 +926,15 @@ struct GitBlameArgs {
     std::string path; std::string ref = "HEAD"; int start = 0; int end = 0;
 };
 
-const util::ArgSpec<GitBlameArgs> kGitBlameArgs{
-    util::arg(&GitBlameArgs::path, "path", "Workspace file to annotate.").required(),
-    util::arg(&GitBlameArgs::ref, "ref", "Commit/ref (default HEAD)."),
-    util::arg(&GitBlameArgs::start, "start_line", "First line to annotate (1-based)."),
-    util::arg(&GitBlameArgs::end, "end_line", "Last line to annotate (inclusive)."),
-};
+const util::ArgSpec<GitBlameArgs>& kGitBlameArgs() {
+    static const util::ArgSpec<GitBlameArgs> spec{
+        util::arg(&GitBlameArgs::path, "path", "Workspace file to annotate.").required(),
+        util::arg(&GitBlameArgs::ref, "ref", "Commit/ref (default HEAD)."),
+        util::arg(&GitBlameArgs::start, "start_line", "First line to annotate (1-based)."),
+        util::arg(&GitBlameArgs::end, "end_line", "Last line to annotate (inclusive)."),
+    };
+    return spec;
+}
 
 // A given range must satisfy 1 <= start <= end.
 std::expected<GitBlameArgs, ToolError> check_git_blame(GitBlameArgs a, const util::Bounds&) {
@@ -957,21 +975,24 @@ struct GitBranchArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<GitBranchArgs> kGitBranchArgs{
-    util::arg(&GitBranchArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&GitBranchArgs::action, "action", "list (default, read-only) | create | "
-              "switch (checkout, creating if needed) | delete")
-        .one_of({"list", "create", "switch", "delete"}),
-    util::arg(&GitBranchArgs::name, "name", "Branch name "
-              "(required for create/switch/delete)"),
-    util::arg(&GitBranchArgs::start_point, "start_point", "Ref to base a "
-              "new branch on (create/switch); default HEAD"),
-    util::arg(&GitBranchArgs::force, "force", "create: reset an "
-              "existing branch; delete: drop even if unmerged (default: false)"),
-    util::arg(&GitBranchArgs::path, "path", "Repository path "
-              "(default: the current project)"),
-};
+const util::ArgSpec<GitBranchArgs>& kGitBranchArgs() {
+    static const util::ArgSpec<GitBranchArgs> spec{
+        util::arg(&GitBranchArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&GitBranchArgs::action, "action", "list (default, read-only) | create | "
+                  "switch (checkout, creating if needed) | delete")
+            .one_of({"list", "create", "switch", "delete"}),
+        util::arg(&GitBranchArgs::name, "name", "Branch name "
+                  "(required for create/switch/delete)"),
+        util::arg(&GitBranchArgs::start_point, "start_point", "Ref to base a "
+                  "new branch on (create/switch); default HEAD"),
+        util::arg(&GitBranchArgs::force, "force", "create: reset an "
+                  "existing branch; delete: drop even if unmerged (default: false)"),
+        util::arg(&GitBranchArgs::path, "path", "Repository path "
+                  "(default: the current project)"),
+    };
+    return spec;
+}
 
 std::expected<GitBranchArgs, ToolError> check_git_branch(GitBranchArgs a, const util::Bounds&) {
     const std::string& action = a.action;
@@ -1119,20 +1140,23 @@ struct GitStashArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<GitStashArgs> kGitStashArgs{
-    util::arg(&GitStashArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&GitStashArgs::action, "action", "list (default, read-only) | push (shelve "
-              "changes) | pop | apply | drop | show")
-        .one_of({"list", "push", "pop", "apply", "drop", "show"}),
-    util::arg(&GitStashArgs::message, "message", "Label for a push"),
-    util::arg(&GitStashArgs::ref, "ref", "Stash entry for "
-              "pop/apply/drop/show, e.g. stash@{1} (default: latest)"),
-    util::arg(&GitStashArgs::include_untracked, "include_untracked", "push: also "
-              "stash untracked files (default: false)"),
-    util::arg(&GitStashArgs::path, "path", "Repository path "
-              "(default: the current project)"),
-};
+const util::ArgSpec<GitStashArgs>& kGitStashArgs() {
+    static const util::ArgSpec<GitStashArgs> spec{
+        util::arg(&GitStashArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&GitStashArgs::action, "action", "list (default, read-only) | push (shelve "
+                  "changes) | pop | apply | drop | show")
+            .one_of({"list", "push", "pop", "apply", "drop", "show"}),
+        util::arg(&GitStashArgs::message, "message", "Label for a push"),
+        util::arg(&GitStashArgs::ref, "ref", "Stash entry for "
+                  "pop/apply/drop/show, e.g. stash@{1} (default: latest)"),
+        util::arg(&GitStashArgs::include_untracked, "include_untracked", "push: also "
+                  "stash untracked files (default: false)"),
+        util::arg(&GitStashArgs::path, "path", "Repository path "
+                  "(default: the current project)"),
+    };
+    return spec;
+}
 
 std::expected<GitStashArgs, ToolError> check_git_stash(GitStashArgs a, const util::Bounds&) {
     if (!a.ref.empty()) {
@@ -1222,19 +1246,22 @@ struct GitRebaseArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<GitRebaseArgs> kGitRebaseArgs{
-    util::arg(&GitRebaseArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&GitRebaseArgs::action, "action", "onto (rebase onto <upstream>) | "
-              "continue | abort | skip — drive an in-progress rebase")
-        .required().one_of({"onto", "continue", "abort", "skip"}),
-    util::arg(&GitRebaseArgs::upstream, "upstream", "Ref to rebase onto "
-              "(required for action=onto), e.g. main or origin/main"),
-    util::arg(&GitRebaseArgs::branch, "branch", "Branch to rebase "
-              "(action=onto; default: current branch)"),
-    util::arg(&GitRebaseArgs::path, "path", "Repository path "
-              "(default: the current project)"),
-};
+const util::ArgSpec<GitRebaseArgs>& kGitRebaseArgs() {
+    static const util::ArgSpec<GitRebaseArgs> spec{
+        util::arg(&GitRebaseArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&GitRebaseArgs::action, "action", "onto (rebase onto <upstream>) | "
+                  "continue | abort | skip — drive an in-progress rebase")
+            .required().one_of({"onto", "continue", "abort", "skip"}),
+        util::arg(&GitRebaseArgs::upstream, "upstream", "Ref to rebase onto "
+                  "(required for action=onto), e.g. main or origin/main"),
+        util::arg(&GitRebaseArgs::branch, "branch", "Branch to rebase "
+                  "(action=onto; default: current branch)"),
+        util::arg(&GitRebaseArgs::path, "path", "Repository path "
+                  "(default: the current project)"),
+    };
+    return spec;
+}
 
 std::expected<GitRebaseArgs, ToolError> check_git_rebase(GitRebaseArgs a, const util::Bounds&) {
     if (a.action == "onto" && a.upstream.empty())
@@ -1306,19 +1333,22 @@ struct GitCherryPickArgs {
     std::string display_description;
 };
 
-const util::ArgSpec<GitCherryPickArgs> kGitCherryPickArgs{
-    util::arg(&GitCherryPickArgs::display_description, "display_description",
-              "One-line summary shown in the UI. Optional."),
-    util::arg(&GitCherryPickArgs::action, "action", "pick (default; apply `commits` onto HEAD) "
-              "| continue | abort | skip")
-        .one_of({"pick", "continue", "abort", "skip"}),
-    util::arg(&GitCherryPickArgs::commits, "commits", "Commit ref(s) to apply (required for "
-              "action=pick); a single string is also accepted"),
-    util::arg(&GitCherryPickArgs::no_commit, "no_commit", "Stage the changes "
-              "without committing (default: false)"),
-    util::arg(&GitCherryPickArgs::path, "path", "Repository path "
-              "(default: the current project)"),
-};
+const util::ArgSpec<GitCherryPickArgs>& kGitCherryPickArgs() {
+    static const util::ArgSpec<GitCherryPickArgs> spec{
+        util::arg(&GitCherryPickArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&GitCherryPickArgs::action, "action", "pick (default; apply `commits` onto HEAD) "
+                  "| continue | abort | skip")
+            .one_of({"pick", "continue", "abort", "skip"}),
+        util::arg(&GitCherryPickArgs::commits, "commits", "Commit ref(s) to apply (required for "
+                  "action=pick); a single string is also accepted"),
+        util::arg(&GitCherryPickArgs::no_commit, "no_commit", "Stage the changes "
+                  "without committing (default: false)"),
+        util::arg(&GitCherryPickArgs::path, "path", "Repository path "
+                  "(default: the current project)"),
+    };
+    return spec;
+}
 
 // commits are required for a pick, and each must be a plain ref.
 std::expected<GitCherryPickArgs, ToolError>
@@ -1386,60 +1416,60 @@ void register_git_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
     sh.add("git_status",
         "Show the current git status: branch, staged/unstaged changes, "
         "untracked files, ahead/behind counts.",
-        kGitStatusArgs.schema(), EffectSet{Effect::ReadFs},
-        body<GitStatusArgs>([exec](const Call& c, const GitStatusArgs& a) { CallExec ce{*exec, c}; return run_git_status(c, a, ce); }, kGitStatusArgs), 30'000);
+        kGitStatusArgs().schema(), EffectSet{Effect::ReadFs},
+        body<GitStatusArgs>([exec](const Call& c, const GitStatusArgs& a) { CallExec ce{*exec, c}; return run_git_status(c, a, ce); }, kGitStatusArgs()), 30'000);
 
     sh.add("git_diff",
         "Show git diff. By default shows unstaged changes. Use staged=true "
         "for staged changes, or specify a ref/range.",
-        kGitDiffArgs.schema(), EffectSet{Effect::ReadFs},
-        body<GitDiffArgs>([exec](const Call& c, const GitDiffArgs& a) { CallExec ce{*exec, c}; return run_git_diff(c, a, ce); }, kGitDiffArgs), 60'000);
+        kGitDiffArgs().schema(), EffectSet{Effect::ReadFs},
+        body<GitDiffArgs>([exec](const Call& c, const GitDiffArgs& a) { CallExec ce{*exec, c}; return run_git_diff(c, a, ce); }, kGitDiffArgs()), 60'000);
 
     sh.add("git_log",
         "Show git commit history. Returns commit hash, author, date, and message.",
-        kGitLogArgs.schema(), EffectSet{Effect::ReadFs},
-        body<GitLogArgs>([exec](const Call& c, const GitLogArgs& a) { CallExec ce{*exec, c}; return run_git_log(c, a, ce); }, kGitLogArgs), 30'000);
+        kGitLogArgs().schema(), EffectSet{Effect::ReadFs},
+        body<GitLogArgs>([exec](const Call& c, const GitLogArgs& a) { CallExec ce{*exec, c}; return run_git_log(c, a, ce); }, kGitLogArgs()), 30'000);
 
     sh.add("git_show",
         "Show a commit with metadata and patch, or read one file exactly as it existed at a revision.",
-        kGitShowArgs.schema(), EffectSet{Effect::ReadFs},
-        body<GitShowArgs>([exec](const Call& c, const GitShowArgs& a) { CallExec ce{*exec, c}; return run_git_show(c, a, ce); }, kGitShowArgs, check_git_show), 60'000);
+        kGitShowArgs().schema(), EffectSet{Effect::ReadFs},
+        body<GitShowArgs>([exec](const Call& c, const GitShowArgs& a) { CallExec ce{*exec, c}; return run_git_show(c, a, ce); }, kGitShowArgs(), check_git_show), 60'000);
 
     sh.add("git_blame",
         "Annotate a file or line range with the commit, author, date, and source line that last changed it.",
-        kGitBlameArgs.schema(), EffectSet{Effect::ReadFs},
-        body<GitBlameArgs>([exec](const Call& c, const GitBlameArgs& a) { CallExec ce{*exec, c}; return run_git_blame(c, a, ce); }, kGitBlameArgs, check_git_blame), 40'000);
+        kGitBlameArgs().schema(), EffectSet{Effect::ReadFs},
+        body<GitBlameArgs>([exec](const Call& c, const GitBlameArgs& a) { CallExec ce{*exec, c}; return run_git_blame(c, a, ce); }, kGitBlameArgs(), check_git_blame), 40'000);
 
     sh.add("git_commit",
         "Stage files and create a git commit. Specify files to stage, "
         "or use stage_all to stage everything.",
-        kGitCommitArgs.schema(), EffectSet{Effect::WriteFs},
-        body<GitCommitArgs>([exec](const Call& c, const GitCommitArgs& a) { CallExec ce{*exec, c}; return run_git_commit(c, a, ce); }, kGitCommitArgs, check_git_commit), 0);
+        kGitCommitArgs().schema(), EffectSet{Effect::WriteFs},
+        body<GitCommitArgs>([exec](const Call& c, const GitCommitArgs& a) { CallExec ce{*exec, c}; return run_git_commit(c, a, ce); }, kGitCommitArgs(), check_git_commit), 0);
 
     sh.add("git_branch",
         "List, create, switch, or delete git branches. action=list (default) "
         "is read-only; create/switch/delete take a `name`.",
-        kGitBranchArgs.schema(), EffectSet{Effect::WriteFs},
-        body<GitBranchArgs>([exec](const Call& c, const GitBranchArgs& a) { CallExec ce{*exec, c}; return run_git_branch(c, a, ce); }, kGitBranchArgs, check_git_branch), 20'000);
+        kGitBranchArgs().schema(), EffectSet{Effect::WriteFs},
+        body<GitBranchArgs>([exec](const Call& c, const GitBranchArgs& a) { CallExec ce{*exec, c}; return run_git_branch(c, a, ce); }, kGitBranchArgs(), check_git_branch), 20'000);
 
     sh.add("git_stash",
         "Shelve or restore uncommitted work. action=list (default) is "
         "read-only; push/pop/apply/drop/show manage the stash.",
-        kGitStashArgs.schema(), EffectSet{Effect::WriteFs},
-        body<GitStashArgs>([exec](const Call& c, const GitStashArgs& a) { CallExec ce{*exec, c}; return run_git_stash(c, a, ce); }, kGitStashArgs, check_git_stash), 50'000);
+        kGitStashArgs().schema(), EffectSet{Effect::WriteFs},
+        body<GitStashArgs>([exec](const Call& c, const GitStashArgs& a) { CallExec ce{*exec, c}; return run_git_stash(c, a, ce); }, kGitStashArgs(), check_git_stash), 50'000);
 
     sh.add("git_rebase",
         "Reapply commits onto a new base (action=onto upstream=<ref>), or "
         "drive an in-progress rebase (continue/abort/skip).",
-        kGitRebaseArgs.schema(), EffectSet{Effect::WriteFs},
-        body<GitRebaseArgs>([exec](const Call& c, const GitRebaseArgs& a) { CallExec ce{*exec, c}; return run_git_rebase(c, a, ce); }, kGitRebaseArgs, check_git_rebase), 50'000);
+        kGitRebaseArgs().schema(), EffectSet{Effect::WriteFs},
+        body<GitRebaseArgs>([exec](const Call& c, const GitRebaseArgs& a) { CallExec ce{*exec, c}; return run_git_rebase(c, a, ce); }, kGitRebaseArgs(), check_git_rebase), 50'000);
 
     sh.add("git_cherry_pick",
         "Apply the changes from existing commit(s) onto HEAD "
         "(action=pick commits=[...]), or drive one in progress "
         "(continue/abort/skip).",
-        kGitCherryPickArgs.schema(), EffectSet{Effect::WriteFs},
-        body<GitCherryPickArgs>([exec](const Call& c, const GitCherryPickArgs& a) { CallExec ce{*exec, c}; return run_git_cherry_pick(c, a, ce); }, kGitCherryPickArgs, check_git_cherry_pick),
+        kGitCherryPickArgs().schema(), EffectSet{Effect::WriteFs},
+        body<GitCherryPickArgs>([exec](const Call& c, const GitCherryPickArgs& a) { CallExec ce{*exec, c}; return run_git_cherry_pick(c, a, ce); }, kGitCherryPickArgs(), check_git_cherry_pick),
         50'000);
 }
 
