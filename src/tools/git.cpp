@@ -509,7 +509,54 @@ ExecResult run_git_status(const Call& call, const GitStatusArgs& a, CallExec& ex
     // indication of WHAT changed inside it. Name the dirty ones so the user
     // knows a git_diff/git_commit needs to target the submodule, not the
     // superproject. Best-effort; skipped silently if there are none.
-    if (auto subs = dirty_submodules(exec, *git_dir); !subs.empty()) {
+    //
+    // dirty_submodules costs a second full `git status` (plus config
+    // probes) — most of this tool's latency. A dirty submodule always shows
+    // as a change row on its own path in the v1 output above, so only pay
+    // for the scan when some changed path is a `.gitmodules` path.
+    const bool maybe_dirty_sub = [&] {
+        const auto gm = exec.call().fs().read(fs::path{*git_dir} / ".gitmodules");
+        if (!gm) return false;
+        // An `ignore =` setting can hide a dirty submodule from the status
+        // above; keep the exhaustive scan then.
+        if (gm->find("ignore") != std::string::npos) return true;
+        std::vector<std::string_view> paths;
+        std::string_view g{*gm};
+        for (std::size_t p = 0; p < g.size();) {
+            auto nl = g.find('\n', p);
+            if (nl == std::string_view::npos) nl = g.size();
+            auto ln = g.substr(p, nl - p);
+            p = nl + 1;
+            while (!ln.empty() && (ln.front() == ' ' || ln.front() == '\t')) ln.remove_prefix(1);
+            if (!ln.starts_with("path")) continue;
+            auto eq = ln.find('=');
+            if (eq == std::string_view::npos) continue;
+            auto v = ln.substr(eq + 1);
+            while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.remove_prefix(1);
+            while (!v.empty() && (v.back() == ' ' || v.back() == '\r' || v.back() == '\t')) v.remove_suffix(1);
+            if (!v.empty()) paths.push_back(v);
+        }
+        if (paths.empty()) return false;
+        // Unparseable/quoted rows: be conservative and scan.
+        std::string_view o{output};
+        for (std::size_t p = 0; p < o.size();) {
+            auto nl = o.find('\n', p);
+            if (nl == std::string_view::npos) nl = o.size();
+            auto row = o.substr(p, nl - p);
+            p = nl + 1;
+            if (row.size() < 4 || row.starts_with("## ")) continue;
+            auto path = row.substr(3);
+            if (path.starts_with('"')) return true;
+            if (auto arrow = path.find(" -> "); arrow != std::string_view::npos)
+                path = path.substr(arrow + 4);
+            while (!path.empty() && path.back() == '/') path.remove_suffix(1);
+            for (auto sp : paths) if (sp == path) return true;
+        }
+        return false;
+    }();
+    if (auto subs = maybe_dirty_sub ? dirty_submodules(exec, *git_dir)
+                                    : std::vector<std::string>{};
+        !subs.empty()) {
         while (!output.empty()
                && (output.back() == '\n' || output.back() == '\r'))
             output.pop_back();

@@ -335,10 +335,25 @@ ExecResult run_find_definition(const Call& call, const FindDefinitionArgs& a, Ca
 
         const auto text = call.fs().read(entry.path);
         if (!text) return WalkStep::next;
-        std::istringstream ifs(*text);
-        std::string line;
-        int n = 1;
-        while (std::getline(ifs, line)) {
+        // Every pattern contains the symbol verbatim, so a file (or line)
+        // without that substring can't match: skip it before std::regex,
+        // which is ~1000x slower than a substring scan. This is what made
+        // the no-rg path take seconds on a mid-size tree.
+        const std::string_view sv{*text};
+        if (sv.find(a.symbol) == std::string_view::npos) return WalkStep::next;
+        int n = 0;
+        std::size_t pos = 0;
+        while (pos <= sv.size()) {
+            std::size_t nl = sv.find('\n', pos);
+            if (nl == std::string_view::npos) nl = sv.size();
+            const std::string_view lv = sv.substr(pos, nl - pos);
+            ++n;
+            pos = nl + 1;
+            if (lv.find(a.symbol) == std::string_view::npos) {
+                if (nl == sv.size()) break;
+                continue;
+            }
+            const std::string line{lv};
             for (const auto& re : patterns) {
                 if (std::regex_search(line, re)) {
                     out << entry.path.string() << ":" << n << ": " << line << "\n";
@@ -346,7 +361,7 @@ ExecResult run_find_definition(const Call& call, const FindDefinitionArgs& a, Ca
                     break;
                 }
             }
-            n++;
+            if (nl == sv.size()) break;
         }
         return WalkStep::next;
     });
