@@ -164,6 +164,8 @@ struct Call {
     const Splitter*       splitter = nullptr;   // null: scans run inline
     FileSystem*           files = nullptr;      // the host's disk; see fs()
     std::string           reader;               // whose context a `read` serves
+    // Trailers the host asked for on any commit this call makes.
+    std::vector<std::string> commit_trailers;
     std::function<bool()> cancelled;            // may be empty
     std::stop_token       stop;                 // the same cancel, as an event
     // Live output for the host to show while the call runs; may be empty.

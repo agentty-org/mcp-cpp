@@ -102,6 +102,9 @@ struct Request {
     // Whose context the call serves (a conversation, a subagent run). A
     // provider that remembers what it has shown someone keys on this.
     std::string reader = {};
+    // Trailers the host wants on any commit this call makes, e.g.
+    // "Co-authored-by: agentty (model) <noreply@agentty.org>". Empty = none.
+    std::vector<std::string> commit_trailers = {};
     // The host's own per-call data, passed through untouched to whatever the
     // host plugged in (its Exec, SkillResolver, SubagentRunner). mcp-cpp
     // never reads it. Lets a host keep call-scoped facts off thread-locals.

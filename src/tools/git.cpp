@@ -779,6 +779,39 @@ std::expected<GitCommitArgs, ToolError> check_git_commit(GitCommitArgs a, const 
     return a;
 }
 
+// The message with the host's trailers in git's trailer block. A trailer
+// already in the message (the model wrote it, or an amend kept it) isn't
+// added twice. Done in the message, not with --trailer, so any git works.
+std::string with_trailers(std::string msg, const std::vector<std::string>& trailers) {
+    std::vector<std::string_view> add;
+    for (const auto& t : trailers)
+        if (!t.empty() && msg.find(t) == std::string::npos) add.push_back(t);
+    if (add.empty()) return msg;
+    while (!msg.empty() && (msg.back() == '\n' || msg.back() == ' ')) msg.pop_back();
+    // Join an existing trailer block (last paragraph is all "Key: value"
+    // lines), else start one after a blank line.
+    const auto para = msg.rfind("\n\n");
+    bool block = para != std::string::npos;
+    if (block) {
+        std::string_view last{msg.data() + para + 2, msg.size() - para - 2};
+        for (std::size_t p = 0; p < last.size() && block;) {
+            auto nl = last.find('\n', p);
+            if (nl == std::string_view::npos) nl = last.size();
+            const auto ln = last.substr(p, nl - p);
+            const auto colon = ln.find(": ");
+            block = colon != std::string_view::npos && colon > 0
+                 && ln.substr(0, colon).find(' ') == std::string_view::npos;
+            p = nl + 1;
+        }
+    }
+    msg += block ? "\n" : "\n\n";
+    for (std::size_t i = 0; i < add.size(); ++i) {
+        if (i) msg += '\n';
+        msg += add[i];
+    }
+    return msg;
+}
+
 ExecResult run_git_commit(const Call& call, const GitCommitArgs& a, CallExec& exec) {
     const auto b = bounds(call);
     // Resolve the repo to commit in from (in priority order): the explicit
@@ -853,7 +886,7 @@ ExecResult run_git_commit(const Call& call, const GitCommitArgs& a, CallExec& ex
             }
             if (!a.message.empty()) {
                 argv.push_back("-m");
-                argv.push_back(a.message);
+                argv.push_back(with_trailers(a.message, call.commit_trailers));
             }
             return argv;
         }()));

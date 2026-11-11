@@ -125,6 +125,7 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
                 call.splitter  = split.get();
                 call.files     = files.get();
                 call.reader    = req.reader;
+                call.commit_trailers = req.commit_trailers;
                 call.cancelled = req.cancelled;
                 call.stop      = req.stop;
                 call.progress  = req.progress;
