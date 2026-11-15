@@ -125,7 +125,6 @@ namespace {
         std::format_to(std::back_inserter(out), "[L{}] {}\n", line_no, trimmed);
         ++emitted;
     };
-    const auto& re = outline_pattern();
     for (std::size_t i = 0; i <= content.size(); ++i) {
         if (i == content.size() || content[i] == '\n') {
             ++line_no;
@@ -640,7 +639,6 @@ symbol_range(std::string_view content, std::string_view symbol,
 [[nodiscard]] std::string render_nested(std::string_view content,
                                         std::size_t max_entries,
                                         int& total_defs) {
-    const auto& re = outline_pattern();
     // Collect (indent_cols, line_no, signature) for each matching line.
     struct Row { int cols; int line; std::string sig; };
     std::vector<Row> rows;

@@ -451,9 +451,8 @@ ExecResult run_extract(const Call& call, const ExtractArgs& a) {
                           "or widen `glob`.", std::nullopt};
 
     std::ostringstream out;
-    int scanned = 0;
     bool capped = false;
-    for (int c : counted) { scanned += c; capped = capped || c >= share_cap; }
+    for (int c : counted) capped = capped || c >= share_cap;
 
     // ── count mode: value → occurrences, desc ─────────────────────────────
     if (a.count) {
