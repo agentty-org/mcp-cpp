@@ -90,6 +90,15 @@ target_link_libraries(mcp_eval_server PRIVATE mcp::tools mcp_test_disk Threads::
 add_executable(mcp_tool_bench tool_bench.cpp)
 target_link_libraries(mcp_tool_bench PRIVATE mcp::tools mcp_test_disk Threads::Threads)
 
+# The shared Myers diff (edit/write/apply_patch hunks): exact and minimal.
+add_executable(mcp_myers_test myers_test.cpp)
+target_link_libraries(mcp_myers_test PRIVATE mcp::tools)
+add_test(NAME mcp_myers_test COMMAND mcp_myers_test)
+
+add_executable(mcp_glob_path_test glob_path_test.cpp)
+target_link_libraries(mcp_glob_path_test PRIVATE mcp::tools)
+add_test(NAME mcp_glob_path_test COMMAND mcp_glob_path_test)
+
 # json_query's jq engine, diffed query-by-query against the real `jq` (300+
 # queries). Skips (exit 77) when jq isn't installed.
 add_executable(mcp_jq_conformance jq_conformance.cpp)

@@ -27,6 +27,7 @@
 #include <mcp/tools/util/error.hpp>
 #include <mcp/tools/util/regex_guard.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
+#include <mcp/tools/util/glob.hpp>
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/utf8.hpp>
 
@@ -89,43 +90,11 @@ constexpr int         kMaxReplaceHits = 10'000;
     return kBin.count(ext) > 0;
 }
 
-// Minimal glob: `*` any-run, `?` one char, `[abc]` class. A slash in the
-// pattern matches against the workspace-relative path; otherwise the
-// filename. Anchored full-match.
-[[nodiscard]] bool glob_one(std::string_view pat, std::string_view s) {
-    std::size_t pi = 0, si = 0, star = std::string_view::npos, mark = 0;
-    while (si < s.size()) {
-        if (pi < pat.size() && (pat[pi] == '?' || pat[pi] == s[si])) { ++pi; ++si; }
-        else if (pi < pat.size() && pat[pi] == '[') {
-            std::size_t j = pi + 1; bool neg = false, ok = false;
-            if (j < pat.size() && (pat[j] == '!' || pat[j] == '^')) { neg = true; ++j; }
-            while (j < pat.size() && pat[j] != ']') {
-                if (j + 2 < pat.size() && pat[j + 1] == '-' && pat[j + 2] != ']') {
-                    if (s[si] >= pat[j] && s[si] <= pat[j + 2]) ok = true;
-                    j += 3;
-                } else { if (s[si] == pat[j]) ok = true; ++j; }
-            }
-            if (ok != neg) { pi = j + 1; ++si; } else if (star != std::string_view::npos) {
-                pi = star + 1; si = ++mark;
-            } else return false;
-        }
-        else if (pi < pat.size() && pat[pi] == '*') { star = pi++; mark = si; }
-        else if (star != std::string_view::npos) { pi = star + 1; si = ++mark; }
-        else return false;
-    }
-    while (pi < pat.size() && pat[pi] == '*') ++pi;
-    return pi == pat.size();
-}
+// Path/basename glob, shared with every walking tool (util/glob.hpp).
 
 [[nodiscard]] bool glob_hit(std::string_view pattern, const fs::path& file,
                             const fs::path& root) {
-    if (pattern.empty()) return true;
-    if (pattern.find('/') != std::string_view::npos) {
-        auto rel = file.lexically_relative(root);   // walked from root: lexical is exact
-        std::string rp = (rel.empty() ? file : rel).generic_string();
-        return glob_one(pattern, rp);
-    }
-    return glob_one(pattern, file.filename().string());
+    return util::glob_path_match(pattern, file, root);
 }
 
 // Collect candidate text files under `root`, honouring the same skip rules as
@@ -137,7 +106,7 @@ collect_files(const FileSystem& files, const fs::path& root, std::string_view fi
     files.walk(root, [&](const DirEntry& entry) {
         auto fn = entry.path.filename().string();
         if (entry.directory) {
-            if (entry.symlink || util::should_skip_dir(fn)) return WalkStep::skip_dir;
+            if (entry.symlink || util::should_skip_dir(fn, file_glob)) return WalkStep::skip_dir;
             return WalkStep::next;
         }
         if (!entry.regular) return WalkStep::next;
@@ -149,6 +118,31 @@ collect_files(const FileSystem& files, const fs::path& root, std::string_view fi
         return WalkStep::next;
     });
     return out;
+}
+
+// Why a scan found nothing, phrased so the next call fixes it. A bare
+// "No files to scan" sent the model guessing; the common causes are a root
+// that does not exist and a glob that never matches (wrong root, a path glob
+// relative to a different directory).
+[[nodiscard]] std::string empty_scan_note(const fs::path& root, std::string_view file_glob) {
+    std::error_code ec;
+    if (!fs::exists(root, ec))
+        return "No files to scan: `" + root.string() + "` does not exist.";
+    if (!fs::is_directory(root, ec))
+        return "No files to scan: `" + root.string() + "` is a file; pass its directory as `path` and its name as `glob`.";
+    std::string s = "No files to scan under `" + root.string() + "`";
+    if (!file_glob.empty()) {
+        s += " matching glob `" + std::string{file_glob} + "`";
+        s += file_glob.find('/') != std::string_view::npos
+            ? ". A glob with '/' is matched against the path RELATIVE TO `path` "
+              "(`**` spans directories); check it starts from that root."
+            : ". A glob without '/' matches file NAMES (`*.ts`, `*.{ts,tsx}`).";
+    } else {
+        s += " (empty, or every file is binary, hidden, empty or over 8 MiB).";
+    }
+    s += " build/, vendor/, third_party/, node_modules/ and similar are skipped "
+         "unless the glob names them or `path` points inside.";
+    return s;
 }
 
 // Conservative ReDoS guard: reject nested unbounded quantifiers up front.
@@ -327,7 +321,7 @@ ExecResult run_extract(const Call& call, const ExtractArgs& a) {
 
     auto files = collect_files(call.fs(), root, a.file_glob);
     if (files.empty())
-        return ToolOutput{"No files to scan (empty dir or all filtered).", std::nullopt};
+        return ToolOutput{empty_scan_note(root, a.file_glob), std::nullopt};
 
     // PERF, measured — this scan is the slowest tool in the set.
     //
@@ -560,7 +554,7 @@ ExecResult run_aggregate(const Call& call, const AggregateArgs& a) {
 
     auto files = collect_files(call.fs(), root, a.file_glob);
     if (files.empty())
-        return ToolOutput{"No files to scan.", std::nullopt};
+        return ToolOutput{empty_scan_note(root, a.file_glob), std::nullopt};
 
     // key → (count, sum, sample lines)
     struct Bucket { long long count = 0; double sum = 0; std::vector<std::string> samples; };
@@ -754,7 +748,7 @@ ExecResult run_replace(const Call& call, const ReplaceArgs& a) {
 
     auto files = collect_files(call.fs(), root, a.file_glob);
     if (files.empty())
-        return ToolOutput{"No files to scan.", std::nullopt};
+        return ToolOutput{empty_scan_note(root, a.file_glob), std::nullopt};
 
     struct Change { std::string path; int hits; std::string before_line, after_line; int line; };
     std::vector<Change> changes;

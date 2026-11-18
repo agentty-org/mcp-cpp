@@ -22,6 +22,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <random>   // the per-call cwd marker nonce
 #include <expected>
 #include <filesystem>
 #include <sstream>
@@ -393,23 +394,25 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
         if (!prev.empty() && exec.call().fs().stat(prev).directory) cwd = prev;
     }
 
-    // Persistent cwd: an EXIT trap writes the final directory to a file in
-    // the HOST's scratch dir (all file IO goes through HostServices::files).
-    // A trap (not a suffix) still fires when the script calls `exit`, and the
-    // path is embedded in the script so no output is parsed. The name comes
-    // from the per-session counter in ToolState, not a library static.
-    std::string cwd_file;
+    // Persistent cwd: an EXIT trap prints the final directory after a
+    // per-call nonce, as the last thing on the output stream, and the tool
+    // cuts it back out. In-band rather than a file in the host's scratch dir:
+    // a sandboxed command has a PRIVATE /tmp, so the file version failed with
+    // "No such file or directory" on every call and never persisted a `cd`.
+    // A trap (not a suffix) still fires when the script calls `exit`. The
+    // nonce is random per call, so output can't forge it.
+    std::string cwd_mark;
 #ifndef _WIN32
-    if (auto scratch = exec.call().fs().scratch_dir(); !scratch.empty()) {
-        const auto n = exec.call().with([](ToolState& s) { return s.next_proc++; });
-        std::error_code ec;
-        exec.call().fs().create_directories(scratch / "shell-cwd", ec);
-        cwd_file = (scratch / "shell-cwd" / ("cwd-" + std::to_string(n))).string();
-        std::string q = "'";
-        for (char c : cwd_file) q += (c == '\'') ? std::string("'\\''") : std::string(1, c);
-        q += "'";
-        effective = "__mcp_cwd_file=" + q
-                  + "; trap 'pwd -P >\"$__mcp_cwd_file\" 2>/dev/null' EXIT\n" + cmd_str;
+    {
+        std::random_device rd;
+        char buf[40];
+        std::snprintf(buf, sizeof buf, "__mcp_cwd_%08x%08x=", rd(), rd());
+        cwd_mark = buf;
+        // printf, not echo: a dir name starting with '-' or holding '\' must
+        // come back verbatim. >&2 so a command's own `>file` can't swallow
+        // it; the runner merges both streams.
+        effective = "trap 'printf \"\\n%s%s\\n\" \"" + cwd_mark
+                  + "\" \"$(pwd -P)\" >&2' EXIT\n" + cmd_str;
     }
 #endif
     // Non-interactive, deterministic child environment (util/child_env).
@@ -459,8 +462,18 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
                 auto rd = st->session->read(kTick, kCaptureCap);
                 if (!rd.output.empty()) {
                     idle_ticks = 0;
-                    if (exec.call().progress)
-                        exec.call().progress(util::strip_terminal_controls(rd.output));
+                    if (exec.call().progress) {
+                        // The cwd trailer is ours, not the command's: keep
+                        // it off the live card.
+                        std::string shown = util::strip_terminal_controls(rd.output);
+                        if (!cwd_mark.empty())
+                            if (auto at = shown.find(cwd_mark); at != std::string::npos) {
+                                auto end = shown.find('\n', at);
+                                auto start = (at > 0 && shown[at - 1] == '\n') ? at - 1 : at;
+                                shown.erase(start, end == std::string::npos ? std::string::npos : end + 1 - start);
+                            }
+                        if (!shown.empty()) exec.call().progress(shown);
+                    }
                     const std::size_t room = kCaptureCap - std::min(kCaptureCap, res.output.size());
                     if (rd.output.size() > room) { rd.output.resize(room); res.truncated = true; }
                     res.output += rd.output;
@@ -515,6 +528,17 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
     // valid UTF-8.
     r.output    = util::strip_terminal_controls(res.output);
     r.truncated = res.truncated;
+    // Cut the cwd trailer back out (the LAST occurrence: it is printed at
+    // exit), remembering the directory it names.
+    std::string final_dir;
+    if (!cwd_mark.empty())
+        if (auto at = r.output.rfind(cwd_mark); at != std::string::npos) {
+            const auto vstart = at + cwd_mark.size();
+            const auto end = r.output.find('\n', vstart);
+            final_dir = r.output.substr(vstart, end == std::string::npos ? std::string::npos : end - vstart);
+            const auto start = (at > 0 && r.output[at - 1] == '\n') ? at - 1 : at;
+            r.output.erase(start, end == std::string::npos ? std::string::npos : end + 1 - start);
+        }
     std::visit([&]<class T>(const T& o) {
         if constexpr (std::is_same_v<T, Exited>)        r.exit_code = o.code;
         else if constexpr (std::is_same_v<T, Signalled>) r.exit_code = 128 + o.signal;
@@ -685,7 +709,7 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
 
     // E: a prompt nobody can answer.
     if (r.timed_out || r.exit_code != 0) {
-        const std::string& raw = res.output;
+        const std::string& raw = r.output;   // the cwd trailer already cut out
         std::size_t end = raw.find_last_not_of(" \t\r\n");
         if (end != std::string::npos) {
             std::size_t start = raw.rfind('\n', end);
@@ -708,14 +732,8 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
                    "tail_lines/head_lines parameters instead of piping]";
     }
     // D: remember where the script ended up.
-    if (!cwd_file.empty()) {
-        std::string dir;
-        if (!bg) {
-            auto& files = exec.call().fs();
-            if (auto txt = files.read(cwd_file)) dir = txt->substr(0, txt->find('\n'));
-            std::error_code ec;
-            files.remove(cwd_file, ec);
-        }
+    if (!cwd_mark.empty()) {
+        const std::string dir = bg ? std::string{} : final_dir;
         if (!dir.empty() && !r.timed_out && dir != cwd) {
             auto b = detail::bounds(exec.call());
             auto wp = util::make_workspace_path_checked(dir, "shell", b);

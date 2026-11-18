@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -18,7 +19,17 @@ namespace mcp::tools::util {
 
 bool is_valid_utf8(std::string_view s) noexcept {
     size_t i = 0;
-    while (i < s.size()) {
+    const size_t n = s.size();
+    while (i < n) {
+        // ASCII fast path, 8 bytes at a time: source files are almost all
+        // ASCII, and this runs over every byte of every read/edit/write.
+        while (i + 8 <= n) {
+            std::uint64_t w;
+            std::memcpy(&w, s.data() + i, 8);
+            if (w & 0x8080808080808080ull) break;
+            i += 8;
+        }
+        if (i >= n) break;
         unsigned char c = (unsigned char)s[i];
         if (c < 0x80) { ++i; continue; }
         int extra; unsigned char mask; uint32_t min_cp;
@@ -26,7 +37,7 @@ bool is_valid_utf8(std::string_view s) noexcept {
         else if ((c & 0xF0) == 0xE0) { extra = 2; mask = 0x0F; min_cp = 0x800; }
         else if ((c & 0xF8) == 0xF0) { extra = 3; mask = 0x07; min_cp = 0x10000; }
         else return false;
-        if (i + (size_t)extra >= s.size()) return false;
+        if (i + (size_t)extra >= n) return false;   // last continuation byte is s[i+extra]
         uint32_t cp = c & mask;
         for (int k = 1; k <= extra; ++k) {
             unsigned char d = (unsigned char)s[i + (size_t)k];

@@ -83,7 +83,7 @@ ExecResult run_glob(const Call& call, const GlobArgs& a) {
     if (!wp) return std::unexpected(std::move(wp.error()));
 
     const auto& pat = a.pattern;
-    bool has_glob = pat.find_first_of("*?[") != std::string::npos;
+    bool has_glob = pat.find_first_of("*?[{") != std::string::npos;
 
     struct Entry {
         std::string path;
@@ -103,14 +103,11 @@ ExecResult run_glob(const Call& call, const GlobArgs& a) {
         auto fn = e.path.filename().string();
         const bool is_dir_entry = e.directory;
         if (e.symlink && is_dir_entry) return WalkStep::skip_dir;
-        if (is_dir_entry && util::should_skip_dir(fn)) return WalkStep::skip_dir;
-        bool hit = has_glob ? util::glob_match(pat, fn)
+        if (is_dir_entry && util::should_skip_dir(fn, pat)) return WalkStep::skip_dir;
+        bool hit = has_glob ? glob_hit(pat, e.path, wp->path())
                             : fn.find(pat) != std::string::npos;
-        // Slash-bearing patterns ('src/*.cpp', '**/util/*.hpp') are PATH
-        // patterns — match them against the workspace-relative path, not
-        // just the basename, so directory-scoped globs work as users expect.
-        if (!hit && has_glob && pat.find('/') != std::string::npos)
-            hit = glob_hit(pat, e.path, wp->path());
+        // A slash-bearing pattern ('src/*.cpp', '**/util/*.hpp') is a PATH
+        // pattern: glob_hit matches it against the workspace-relative path.
         if (hit) {
             const bool is_link = e.symlink;
             uintmax_t sz = 0;
@@ -549,20 +546,7 @@ std::expected<GrepArgs, ToolError> check_grep(GrepArgs g, const util::Bounds&) {
 [[nodiscard]] bool glob_hit(std::string_view pattern,
                             const fs::path& file,
                             const fs::path& root) {
-    if (pattern.find('/') == std::string_view::npos)
-        return util::glob_match(pattern, file.filename().string());
-
-    // Lexical: `file` came from walking `root`, so it's under it as given.
-    fs::path rel = file.lexically_relative(root);
-    std::string rp = (rel.empty() ? file : rel).generic_string();
-    while (rp.starts_with("./")) rp.erase(0, 2);
-
-    if (util::glob_match(pattern, rp)) return true;
-    // "**/" prefix (or a bare "**") should also match paths at the root with
-    // no leading directory — strip it and retry so "**/foo.c" hits "foo.c".
-    if (pattern.starts_with("**/"))
-        return util::glob_match(pattern.substr(3), rp);
-    return false;
+    return util::glob_path_match(pattern, file, root);
 }
 
 [[nodiscard]] bool likely_binary_ext(const fs::path& p) {
@@ -985,7 +969,7 @@ ExecResult run_ripgrep_counts(const GrepArgs& a, CallExec& exec) {
     if (!a.literal && is_literal_pattern(a.pattern)) argv.push_back("-F");
     if (a.pattern.find('\n') != std::string::npos || a.pattern.find("\\n") != std::string::npos)
         argv.push_back("-U");
-    for (const auto& g : util::skip_dir_rg_globs()) argv.push_back(g);
+    for (const auto& g : util::skip_dir_rg_globs(a.file_glob)) argv.push_back(g);
     if (!a.file_glob.empty()) { argv.push_back("-g"); argv.push_back(a.file_glob); }
     argv.push_back("--");
     argv.push_back(a.pattern);
@@ -1080,7 +1064,7 @@ ExecResult run_ripgrep(const GrepArgs& a, CallExec& exec) {
     // file (tens of thousands in a repo with out-of-source build dirs) on a
     // cold cache, and scans them outright when there's no .gitignore. Match
     // should_skip_dir() exactly so grep behaves identically on both backends.
-    for (const auto& g : util::skip_dir_rg_globs()) argv.push_back(g);
+    for (const auto& g : util::skip_dir_rg_globs(a.file_glob)) argv.push_back(g);
     if (!a.file_glob.empty()) {
         argv.push_back("-g");
         argv.push_back(a.file_glob);
@@ -1354,7 +1338,7 @@ ExecResult run_builtin(const Call& call, const GrepArgs& a) {
         call.fs().walk(fs::path{a.root}, [&](const DirEntry& entry) {
             auto fn = entry.path.filename().string();
             if (entry.directory) {
-                if (entry.symlink || util::should_skip_dir(fn)) return WalkStep::skip_dir;
+                if (entry.symlink || util::should_skip_dir(fn, a.file_glob)) return WalkStep::skip_dir;
                 return WalkStep::next;
             }
             if (!entry.regular) return WalkStep::next;

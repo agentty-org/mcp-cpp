@@ -181,6 +181,14 @@ int main() {
         auto ex = run({{"command", "pwd"}, {"cd", root.string()}});
         CHECK(!has(ex.text, "/sub"));
         run({{"command", "cd .."}});
+        // The cwd trailer is in-band; it must never reach the model, whether
+        // the script exits normally, calls `exit`, or redirects stdout.
+        for (const char* c : {"echo hi", "echo hi; exit 3", "echo hi >/dev/null", "true"}) {
+            auto t = run({{"command", c}});
+            CHECK(!has(t.text, "__mcp_cwd_"));
+        }
+        auto q = run({{"command", "echo 'Proceed? [y/N]'; exit 1"}});
+        CHECK(!has(q.text, "__mcp_cwd_"));
     }
     // ── prompt hint ─────────────────────────────────────────────────────
     {

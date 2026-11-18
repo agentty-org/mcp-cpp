@@ -230,6 +230,19 @@ promote_to_workspace_path(NormalizedPath p, std::string_view tool_name, const Bo
 // straight into its argument vector.
 [[nodiscard]] const std::vector<std::string>& skip_dir_rg_globs();
 
+// The default skip set yields to an explicit ask: a skip-listed directory
+// (third_party, vendor, build-*, node_modules) is walked when the caller's
+// glob names it as a literal path segment -- `third_party/mcp-cpp/src/*.cpp`,
+// `**/vendor/*.go`, `build/compile_commands.json`. Pruning it anyway made
+// those globs report "no files" with no hint why.
+[[nodiscard]] bool glob_names_dir(std::string_view glob, std::string_view dir_name) noexcept;
+
+// should_skip_dir, unless `glob` names the directory (glob_names_dir).
+[[nodiscard]] bool should_skip_dir(std::string_view name, std::string_view glob) noexcept;
+
+// skip_dir_rg_globs minus the excludes `glob` explicitly reaches into.
+[[nodiscard]] std::vector<std::string> skip_dir_rg_globs(std::string_view glob);
+
 // Heuristic: scan the first 512 bytes for a NUL. Good enough to avoid
 // grep'ing PNGs / executables / model weights into the prompt.
 [[nodiscard]] bool is_binary_file(const FileSystem& files, const fs::path& p);

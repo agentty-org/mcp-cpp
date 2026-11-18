@@ -377,6 +377,68 @@ const std::vector<std::string>& skip_dir_rg_globs() {
     return globs;
 }
 
+bool glob_names_dir(std::string_view glob, std::string_view dir_name) noexcept {
+    if (glob.empty() || dir_name.empty()) return false;
+    // Segment-wise; a segment with a wildcard never counts as naming a
+    // directory (`*` must not unprune everything). Brace alternatives count:
+    // `{third_party,src}/**/*.c` and `**/{vendor,lib}/*.go` name them.
+    std::size_t i = 0;
+    while (i <= glob.size()) {
+        const std::size_t j = glob.find_first_of("/\\", i);
+        auto seg = glob.substr(i, j == std::string_view::npos ? std::string_view::npos : j - i);
+        if (seg == dir_name) return true;
+        if (seg.size() > 2 && seg.front() == '{' && seg.back() == '}') {
+            seg = seg.substr(1, seg.size() - 2);
+            for (std::size_t a = 0; a <= seg.size();) {
+                const auto c = seg.find(',', a);
+                if (seg.substr(a, c == std::string_view::npos ? std::string_view::npos : c - a)
+                    == dir_name)
+                    return true;
+                if (c == std::string_view::npos) break;
+                a = c + 1;
+            }
+        }
+        if (j == std::string_view::npos) break;
+        i = j + 1;
+    }
+    return false;
+}
+
+bool should_skip_dir(std::string_view name, std::string_view glob) noexcept {
+    return should_skip_dir(name) && !glob_names_dir(glob, name);
+}
+
+std::vector<std::string> skip_dir_rg_globs(std::string_view glob) {
+    const auto& all = skip_dir_rg_globs();
+    if (glob.empty()) return all;
+    // Literal segments of the glob, to test the build*/cmake-build* families.
+    std::vector<std::string_view> segs;
+    for (std::size_t i = 0; i <= glob.size();) {
+        const std::size_t j = glob.find_first_of("/\\", i);
+        auto seg = glob.substr(i, j == std::string_view::npos ? std::string_view::npos : j - i);
+        if (!seg.empty() && seg.find_first_of("*?[") == std::string_view::npos) segs.push_back(seg);
+        if (j == std::string_view::npos) break;
+        i = j + 1;
+    }
+    std::vector<std::string> v;
+    v.reserve(all.size());
+    for (std::size_t k = 0; k + 1 < all.size(); k += 2) {
+        std::string_view ex = all[k + 1];
+        ex.remove_prefix(1);   // drop the '!'
+        bool reached = false;
+        if (ex.ends_with('*')) {
+            const auto stem = ex.substr(0, ex.size() - 1);
+            for (auto s : segs) if (s.starts_with(stem)) { reached = true; break; }
+        } else {
+            for (auto s : segs) if (s == ex) { reached = true; break; }
+        }
+        if (reached) continue;
+        v.push_back(all[k]);
+        v.push_back(all[k + 1]);
+    }
+    return v;
+}
+
 bool is_binary_file(const FileSystem& files, const fs::path& p) {
     const auto head = files.read_prefix(p, 512);
     // Can't open (permission denied, transient lock, race-deleted): NOT

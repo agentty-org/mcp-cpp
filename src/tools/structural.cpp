@@ -509,11 +509,11 @@ ExecResult run_structural(const Call& call, const StructArgs& a, DocRetriever* s
         call.fs().walk(wp->path(), [&](const DirEntry& e) {
             if (e.symlink) return e.directory ? WalkStep::skip_dir : WalkStep::next;
             if (e.directory)
-                return util::should_skip_dir(e.path.filename().string()) ? WalkStep::skip_dir
-                                                                          : WalkStep::next;
+                return util::should_skip_dir(e.path.filename().string(), a.glob)
+                           ? WalkStep::skip_dir : WalkStep::next;
             const fs::path& p = e.path;
             if (!is_source_ext(p)) return WalkStep::next;
-            if (!a.glob.empty() && !util::glob_match(a.glob, p.filename().string()))
+            if (!a.glob.empty() && !util::glob_path_match(a.glob, p, wp->path()))
                 return WalkStep::next;
             files.push_back(p);
             return files.size() >= kMaxScanned ? WalkStep::stop : WalkStep::next;
@@ -834,11 +834,11 @@ ExecResult run_rewrite(const Call& call, const RewriteArgs& a) {
         call.fs().walk(wp->path(), [&](const DirEntry& e) {
             if (e.symlink) return e.directory ? WalkStep::skip_dir : WalkStep::next;
             if (e.directory)
-                return util::should_skip_dir(e.path.filename().string()) ? WalkStep::skip_dir
-                                                                          : WalkStep::next;
+                return util::should_skip_dir(e.path.filename().string(), a.glob)
+                           ? WalkStep::skip_dir : WalkStep::next;
             const fs::path& p = e.path;
             if (!is_source_ext(p)) return WalkStep::next;
-            if (!a.glob.empty() && !util::glob_match(a.glob, p.filename().string()))
+            if (!a.glob.empty() && !util::glob_path_match(a.glob, p, wp->path()))
                 return WalkStep::next;
             files.push_back(p);
             return files.size() >= kMaxScanned ? WalkStep::stop : WalkStep::next;
