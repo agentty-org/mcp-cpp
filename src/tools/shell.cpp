@@ -462,10 +462,16 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
                 auto rd = st->session->read(kTick, kCaptureCap);
                 if (!rd.output.empty()) {
                     idle_ticks = 0;
+                    const std::size_t room = kCaptureCap - std::min(kCaptureCap, res.output.size());
+                    if (rd.output.size() > room) { rd.output.resize(room); res.truncated = true; }
+                    res.output += rd.output;
                     if (exec.call().progress) {
-                        // The cwd trailer is ours, not the command's: keep
-                        // it off the live card.
-                        std::string shown = util::strip_terminal_controls(rd.output);
+                        // progress takes the WHOLE output so far (each call
+                        // replaces the card), not the newest chunk: handing
+                        // it only the chunk made the card show one line at a
+                        // time and an ACP client see a single update. The cwd
+                        // trailer is ours, not the command's: keep it off.
+                        std::string shown = util::strip_terminal_controls(res.output);
                         if (!cwd_mark.empty())
                             if (auto at = shown.find(cwd_mark); at != std::string::npos) {
                                 auto end = shown.find('\n', at);
@@ -474,9 +480,6 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
                             }
                         if (!shown.empty()) exec.call().progress(shown);
                     }
-                    const std::size_t room = kCaptureCap - std::min(kCaptureCap, res.output.size());
-                    if (rd.output.size() > room) { rd.output.resize(room); res.truncated = true; }
-                    res.output += rd.output;
                 } else {
                     ++idle_ticks;
                 }
