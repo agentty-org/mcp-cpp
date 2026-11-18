@@ -10,6 +10,7 @@
 #include <mcp/tools/host.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -31,11 +32,18 @@ namespace mcp::test {
 // the SIGKILL).
 class BgSession final : public tools::Session {
 public:
-    BgSession(pid_t pid, int fd) : pid_(pid), fd_(fd), started_(std::chrono::steady_clock::now()) {
+    BgSession(pid_t pid, int fd, std::size_t window = 128 * 1024, std::string log = {})
+        : kWindow(window), pid_(pid), fd_(fd), started_(std::chrono::steady_clock::now()) {
+        if (!log.empty()) {
+            log_fd_ = ::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+            if (log_fd_ >= 0) log_ = std::move(log);
+        }
         reader_ = std::thread([this] {
             char buf[4096];
             for (;;) {
                 const auto n = ::read(fd_, buf, sizeof buf);
+                // The full log sees every byte before the window can drop any.
+                if (n > 0 && log_fd_ >= 0) (void)!::write(log_fd_, buf, static_cast<std::size_t>(n));
                 std::lock_guard lk(mu_);
                 if (n <= 0) { eof_ = true; cv_.notify_all(); return; }
                 buf_.append(buf, static_cast<std::size_t>(n));
@@ -62,7 +70,9 @@ public:
         if (reaper_.joinable()) reaper_.join();
         if (reader_.joinable()) reader_.join();
         ::close(fd_);
+        if (log_fd_ >= 0) ::close(log_fd_);
     }
+    std::string log_path() const override { return log_; }
     Read read(std::chrono::milliseconds wait, std::size_t max) override {
         std::unique_lock lk(mu_);
         const auto fresh = [&] { return base_ + buf_.size() > seen_; };
@@ -89,7 +99,8 @@ public:
         if (!exited_) ::kill(-pid_, SIGKILL);
     }
 private:
-    static constexpr std::size_t kWindow = 128 * 1024;
+    // The host window, like agentty's JaalExec: ExecRequest::max_output_bytes.
+    const std::size_t kWindow;
     pid_t pid_;
     int   fd_;
     std::chrono::steady_clock::time_point started_;
@@ -100,6 +111,8 @@ private:
     bool eof_ = false, exited_ = false;
     tools::ExecOutcome outcome_ = tools::Exited{0};
     std::thread reader_, reaper_;
+    int         log_fd_ = -1;
+    std::string log_;
 };
 
 struct PopenExec final : tools::Exec {
@@ -160,7 +173,13 @@ struct PopenExec final : tools::Exec {
             ::_exit(127);
         }
         ::close(fds[1]);
-        return std::make_shared<BgSession>(pid, fds[0]);
+        std::string log;
+        if (r.keep_full_log) {
+            static std::atomic<unsigned> n{0};   // tests may share state; the library may not
+            log = "/tmp/mcp-test-proc-" + std::to_string(::getpid()) + "-" + std::to_string(n++) + ".log";
+        }
+        return std::make_shared<BgSession>(pid, fds[0], r.max_output_bytes.value_or(128 * 1024),
+                                           std::move(log));
     }
     bool stops_whole_tree() const noexcept override { return false; }
 };

@@ -19,6 +19,7 @@ struct FuzzyMatch {
     int         count;   // total matches seen (1 on ok; >1 means ambiguous)
     std::string adjusted_new_text;  // re-indented replacement, or empty
     int         strategy = 0;       // 0=none, 1=exact, 2=DP (diagnostics)
+    double      ratio = 0.0;        // alignment ratio of the accepted match (1.0 = exact)
 
     // Set (1-based) when the ONLY candidate was a fuzzy one sitting further
     // than LINE_HINT_TOLERANCE from an explicit `line:` hint, so ok==false.

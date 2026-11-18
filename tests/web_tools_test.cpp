@@ -166,4 +166,109 @@ TEST_CASE("web_tools") {
         assert(r.is_error);
         std::puts("web tools: absent without HttpClient");
     }
+
+    // ── a JS-only page is NEVER sent to r.jina.ai by default ────────────
+    std::string shell = "<html><body><div id=\"root\"></div>";
+    for (int i = 0; i < 10; ++i) shell += "<script src=\"/a" + std::to_string(i) + ".js\"></script>";
+    shell += "</body></html>";
+    {
+        auto f2 = std::make_shared<FakeHttp>();
+        f2->rules.push_back({"r.jina.ai", [] { HttpResponse r; r.status = 200;
+            r.body = std::string(3000, 'J'); return r; }()});
+        f2->rules.push_back({"spa.test", html_resp(shell)});
+        HostServices s2; s2.files = std::make_shared<mcp::test::DiskFiles>(); s2.http = f2;
+        auto p = make_provider(s2, ToolsetConfig{}, "local");
+
+        auto a = obj(); a["url"] = "https://spa.test/app";
+        auto r = call(*p, "web_fetch", a);
+        CHECK(!r.is_error);
+        CHECK(r.text.find("needs JavaScript") != std::string::npos
+              || r.text.find("need JavaScript") != std::string::npos);
+        for (const auto& u : f2->seen_urls) CHECK(u.find("jina") == std::string::npos);
+
+        // opt-in renders it
+        f2->seen_urls.clear();
+        a["render"] = "jina";
+        a["url"] = "https://spa.test/app2";
+        r = call(*p, "web_fetch", a);
+        CHECK(r.text.find("via r.jina.ai") != std::string::npos);
+
+        // ...but never for a URL carrying a token, or an intranet host
+        f2->seen_urls.clear();
+        a["url"] = "https://spa.test/cb?access_token=abc";
+        r = call(*p, "web_fetch", a);
+        CHECK(r.text.find("refused") != std::string::npos);
+        for (const auto& u : f2->seen_urls) CHECK(u.find("jina") == std::string::npos);
+        std::puts("web_fetch: jina opt-in only, refused for secret-bearing URLs");
+    }
+
+    // ── cache, paging, legacy charset ────────────────────────────────────
+    {
+        auto f3 = std::make_shared<FakeHttp>();
+        HttpResponse big; big.status = 200;
+        big.headers.push_back({"content-type", "text/plain"});
+        big.body = std::string(5000, 'a') + std::string(5000, 'b');
+        f3->rules.push_back({"big.test", big});
+        HttpResponse latin; latin.status = 200;
+        latin.headers.push_back({"content-type", "text/plain; charset=ISO-8859-1"});
+        latin.body = "caf\xE9 \x93quoted\x94";
+        f3->rules.push_back({"latin.test", latin});
+        HostServices s3; s3.files = std::make_shared<mcp::test::DiskFiles>(); s3.http = f3;
+        auto p = make_provider(s3, ToolsetConfig{}, "local");
+
+        auto a = obj(); a["url"] = "https://big.test/doc"; a["max_chars"] = 6000;
+        auto r1 = call(*p, "web_fetch", a);
+        CHECK(r1.text.find("pass start_char=6000") != std::string::npos);
+        CHECK(r1.text.find("of 10000") != std::string::npos);
+        a["start_char"] = 6000;
+        auto r2 = call(*p, "web_fetch", a);
+        CHECK(r2.text.find("cached") != std::string::npos);      // second fetch: no request
+        CHECK(f3->seen_urls.size() == 1);
+        CHECK(r2.text.find("bbbb") != std::string::npos);
+        CHECK(r2.text.find("aaaa") == std::string::npos);
+
+        auto l = obj(); l["url"] = "https://latin.test/";
+        auto r3 = call(*p, "web_fetch", l);
+        CHECK(r3.text.find("caf\xC3\xA9") != std::string::npos);            // é
+        CHECK(r3.text.find("\xE2\x80\x9Cquoted\xE2\x80\x9D") != std::string::npos); // “ ” (cp1252)
+
+        // Requests with credentials bypass the cache.
+        auto c = obj(); c["url"] = "https://big.test/doc";
+        c["headers"] = mcp::Json{{"Authorization", "Bearer x"}};
+        const auto before = f3->seen_urls.size();
+        (void)call(*p, "web_fetch", c);
+        CHECK(f3->seen_urls.size() == before + 1);
+        std::puts("web_fetch: paging, cache, latin1/cp1252 decoding");
+    }
+
+    // ── web_search domain filters ──────────────────────────────────────────
+    {
+        auto f4 = std::make_shared<FakeHttp>();
+        std::string page;
+        for (const char* u : {"https://docs.python.org/3/a", "https://evil-python.org/b",
+                              "https://www.python.org/c", "https://spam.test/d"})
+            page += std::string("<div class=\"snippet svelte-x\"><a href=\"") + u + "\" class=\"l1\">x</a>"
+                    "<div class=\"title svelte-y\">T " + u + "</div>"
+                    "<div class=\"generic-snippet svelte-z\">s</div></div>";
+        f4->rules.push_back({"search.brave.com", html_resp(page)});
+        HostServices s4; s4.files = std::make_shared<mcp::test::DiskFiles>(); s4.http = f4;
+        auto p = make_provider(s4, ToolsetConfig{}, "local");
+
+        auto a = obj(); a["query"] = "asyncio";
+        a["allowed_domains"] = mcp::Json::array({"python.org"});
+        auto r = call(*p, "web_search", a);
+        CHECK(r.text.find("docs.python.org") != std::string::npos);
+        CHECK(r.text.find("www.python.org") != std::string::npos);
+        CHECK(r.text.find("evil-python.org") == std::string::npos);   // suffix, not substring
+        CHECK(r.text.find("spam.test") == std::string::npos);
+        CHECK(f4->seen_urls.back().find("site") != std::string::npos);  // steered the engine
+
+        auto b = obj(); b["query"] = "asyncio";
+        b["blocked_domains"] = mcp::Json::array({"spam.test", "docs.python.org"});
+        auto rb = call(*p, "web_search", b);
+        CHECK(rb.text.find("spam.test") == std::string::npos);
+        CHECK(rb.text.find("docs.python.org") == std::string::npos);
+        CHECK(rb.text.find("www.python.org") != std::string::npos);
+        std::puts("web_search: allowed/blocked domain filters");
+    }
 }

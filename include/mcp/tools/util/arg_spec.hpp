@@ -40,6 +40,7 @@ template <class T>
 concept ArgValue =
     std::same_as<T, std::string> || std::same_as<T, int> || std::same_as<T, bool>
     || std::same_as<T, std::optional<std::string>> || std::same_as<T, std::optional<int>>
+    || std::same_as<T, std::optional<bool>>
     || std::same_as<T, std::vector<std::string>> || std::same_as<T, nlohmann::json>;
 
 /// One argument: where it lands, its key, and what the model is told.
@@ -136,6 +137,13 @@ public:
             if (required_ && !r.has(key_)) return missing();
             dst = r.boolean(key_, dst);
             return std::nullopt;
+        } else if constexpr (std::same_as<V, std::optional<bool>>) {
+            // Tri-state: absent (or null) stays nullopt, so the tool can tell
+            // "not passed" from an explicit false (e.g. grep smart-case).
+            if (const auto* v = r.raw(key_); v && !v->is_null())
+                dst = r.boolean(key_, false);
+            else if (required_) return missing();
+            return std::nullopt;
         } else if constexpr (std::same_as<V, std::vector<std::string>>) {
             const auto* v = r.raw(key_);
             if (!v || v->is_null()) {
@@ -187,7 +195,7 @@ private:
     static constexpr const char* type_name() {
         if constexpr (std::same_as<V, std::string> || std::same_as<V, std::optional<std::string>>) return "string";
         else if constexpr (std::same_as<V, int> || std::same_as<V, std::optional<int>>) return "integer";
-        else if constexpr (std::same_as<V, bool>) return "boolean";
+        else if constexpr (std::same_as<V, bool> || std::same_as<V, std::optional<bool>>) return "boolean";
         else if constexpr (std::same_as<V, std::vector<std::string>>) return "array";
         else return "object";
     }

@@ -100,6 +100,7 @@ struct Proc {
     std::string                           id;
     std::string                           command;
     std::shared_ptr<tools::Session>       session;
+    std::string                           log;   // full-output log path; may be empty
 };
 
 }  // namespace state
@@ -132,6 +133,21 @@ struct ToolState {
                   "a Proc in the map is immutable; mutable process state belongs "
                   "to the host's Session");
     unsigned long long next_proc = 1;
+
+    // Where the next `shell` call without `cd` starts (the last call's final
+    // directory, inside the workspace). Empty: the default.
+    std::string shell_cwd;
+
+    // web_fetch's response cache: the session's last 32 successful GETs,
+    // most recent first. A value the caller owns (docs/PROTOCOL_LIBRARIES.md
+    // §4.7), not a library static, and aged by count, so no clock is read.
+    struct CachedFetch {
+        std::string key;
+        int         status = 0;
+        std::string content_type;
+        std::string body;
+    };
+    std::vector<CachedFetch> fetch_cache;
 
     // repo_map's built graphs (see state::RepoGraphCache).
     std::shared_ptr<state::RepoGraphCache> repo_graphs;

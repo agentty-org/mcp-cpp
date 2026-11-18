@@ -172,16 +172,43 @@ TEST_CASE("search_tools") {
         std::puts("grep: glob filter ok");
     }
 
-    // ── grep is case-insensitive by default ──────────────────────────────
+    // ── grep smart case: lowercase pattern → any case ───────────────────────
     {
         auto args = obj();
-        args["pattern"] = "needle_MARKER";   // different case than on disk
+        args["pattern"] = "needle_marker";   // all lowercase; on disk is NEEDLE_marker
         args["path"]    = root.string();
         auto r = call(*provider, "grep", args);
         assert(!r.is_error);
         assert(r.text.find("alpha.cpp") != std::string::npos);
         assert(r.text.find("beta.txt") != std::string::npos);
-        std::puts("grep: case-insensitive default ok");
+        std::puts("grep: smart case (lowercase → insensitive) ok");
+    }
+
+    // ── grep smart case: an uppercase letter makes it exact ──────────────
+    {
+        auto args = obj();
+        args["pattern"] = "needle_MARKER";   // has uppercase, matches nothing exactly
+        args["path"]    = root.string();
+        auto r = call(*provider, "grep", args);
+        assert(r.text.find("alpha.cpp") == std::string::npos);
+        // the hint names the cause so the model can flip it in one call
+        assert(r.text.find("smart case") != std::string::npos);
+        args["case_sensitive"] = false;       // explicit override wins
+        r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("alpha.cpp") != std::string::npos);
+        std::puts("grep: smart case (uppercase → exact, override) ok");
+    }
+
+    // ── grep smart case ignores escapes like \W / \S ──────────────────────
+    {
+        auto args = obj();
+        args["pattern"] = "needle\\Wmarker|needle_marker";
+        args["path"]    = root.string();
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("alpha.cpp") != std::string::npos);
+        std::puts("grep: smart case skips regex escapes ok");
     }
 
     // ── grep case_sensitive=true respects case ───────────────────────────

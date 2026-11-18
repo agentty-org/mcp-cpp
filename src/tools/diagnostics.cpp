@@ -7,6 +7,7 @@
 #include "tool_shell.hpp"
 #include "call_state.hpp"
 #include "tool_body.hpp"
+#include "util/child_env.hpp"
 
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
@@ -82,6 +83,7 @@ const util::ArgSpec<DiagnosticsArgs>& kDiagnosticsArgs() {
         std::string_view shell_cmd, std::size_t max_bytes,
         std::chrono::seconds timeout) {
     ExecRequest req;
+    req.env = util::non_interactive_env();
     if (!argv.empty())
         req.program = {argv.front(), {argv.begin() + 1, argv.end()}};
     else

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// data_test.cpp — json_query (jq-lite) driven through make_provider().
+// data_test.cpp — json_query (jq) driven through make_provider(), plus the
+// jq engine directly (cases cross-checked against jq 1.8.2).
 
 #include "support/disk_files.hpp"
+#include "../src/tools/util/jq.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/toolset.hpp>
@@ -12,6 +14,7 @@
 #include "agtest.hpp"
 #include "test_state.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -157,6 +160,131 @@ TEST_CASE("json_query") {
         check(call(*provider, "json_query", b).is_error, "missing path AND json is an error");
         // unknown verb
         check(q(".scripts | frobnicate").is_error, "unknown pipeline verb is an error");
+        // a syntax error names the column
+        auto se = q(".services[");
+        check(se.is_error && has(se.text, "col"), "syntax error carries a column");
+    }
+
+    // ── the jq engine (util::jq) — real jq semantics ─────────────────────
+    {
+        namespace jq = mcp::tools::util::jq;
+        using oj = nlohmann::ordered_json;
+        const oj doc = oj::parse(R"({
+          "deps": {"react": "^18.2.0", "zod": "3.22.4", "lodash": "^4.17.21"},
+          "svc": [
+            {"name": "api", "port": 8080, "kind": "web", "ok": true, "n": 3},
+            {"name": "db", "port": 5432, "kind": "data", "ok": false, "n": 1},
+            {"name": "cache", "kind": "data", "ok": true, "n": 5}
+          ],
+          "nested": {"a": {"port": 1, "b": [{"port": 2}, {"x": null}]}},
+          "nums": [3, 1.5, -2, 10],
+          "text": "héllo wörld 42"
+        })");
+        // Each case: query -> expected newline-joined compact outputs.
+        const std::pair<const char*, const char*> cases[] = {
+            {".deps | to_entries | map(select(.value | startswith(\"^\"))) | map(.key)", R"(["react","lodash"])"},
+            {"[.. | .port? // empty]", "[8080,5432,1,2]"},
+            {".svc | group_by(.kind) | map({kind: .[0].kind, n: length})", R"([{"kind":"data","n":2},{"kind":"web","n":1}])"},
+            {"[.svc[] | select(.n > 2 and .ok) | .name]", R"(["api","cache"])"},
+            {".missing // \"d\"", R"("d")"},
+            {"[.svc[].port // 0]", "[8080,5432]"},        // `//` applies to the whole stream
+            {"[.svc[] | .port // 0]", "[8080,5432,0]"},
+            {".nums[1:3]", "[1.5,-2]"},
+            {".nums[-1]", "10"},
+            {".nums | add", "12.5"},
+            {".nums | sort", "[-2,1.5,3,10]"},
+            {".nums | min, max", "-2\n10"},
+            {".svc | sort_by(.n) | map(.name)", R"(["db","api","cache"])"},
+            {".svc | max_by(.n) | .name", R"("cache")"},
+            {".svc | unique_by(.kind) | length", "2"},
+            {".deps | keys", R"(["lodash","react","zod"])"},
+            {".deps | keys_unsorted", R"(["react","zod","lodash"])"},
+            {"{name: .svc[0].name, count: (.svc | length)}", R"({"name":"api","count":3})"},
+            {"\"\\(.svc[0].name):\\(.svc[0].port)\"", R"("api:8080")"},
+            {"reduce .svc[] as $s ({}; .[$s.kind] += [$s.name])", R"({"web":["api"],"data":["db","cache"]})"},
+            {"[foreach .nums[] as $n (0; . + $n)]", "[3,4.5,2.5,12.5]"},
+            {"[limit(2; .svc[].name)]", R"(["api","db"])"},
+            {"first(.svc[] | select(.kind == \"data\")) | .name", R"("db")"},
+            {"[range(1; 10; 3)]", "[1,4,7]"},
+            {"if (.svc | length) > 2 then \"many\" else \"few\" end", R"("many")"},
+            {"try error(\"boom\") catch .", R"("boom")"},
+            {"[.svc[] | try (if .ok then .name else error(\"x\") end) catch \"caught\"]", R"(["api","caught","cache"])"},
+            {".text | test(\"WÖRLD\"; \"i\")", "true"},
+            {".text | [match(\"\\\\w+\"; \"g\") | .string]", R"(["héllo","wörld","42"])"},
+            {".text | capture(\"(?<n>[0-9]+)\") | .n", R"("42")"},
+            {".text | gsub(\"[aeiou]\"; \"_\")", R"("héll_ wörld 42")"},
+            {".text | length", "14"},
+            {".text | split(\" \")", R"(["héllo","wörld","42"])"},
+            {"[.svc[].name] | join(\",\")", R"("api,db,cache")"},
+            {"[.svc[].name] | @csv", R"("\"api\",\"db\",\"cache\"")"},
+            {"del(.svc[] | select(.ok | not)) | .svc | map(.name)", R"(["api","cache"])"},
+            {".svc[].n |= . * 10 | [.svc[].n]", "[30,10,50]"},
+            {".svc[0].port = 1 | .svc[0].port", "1"},
+            {".newkey //= \"x\" | .newkey", R"("x")"},
+            {"[paths(type == \"number\")] | length", "11"},
+            {".nested | getpath([\"a\", \"b\", 0, \"port\"])", "2"},
+            {"pick(.svc[1].name) | .svc[1]", R"({"name":"db"})"},
+            {"walk(if type == \"number\" then . + 1 else . end) | .nums", "[4,2.5,-1,11]"},
+            {".svc | INDEX(.name) | keys", R"(["api","cache","db"])"},
+            {"IN(.svc[].name; \"db\")", "true"},
+            {".svc | any(.port == 5432), all(.ok)", "true\nfalse"},
+            {"(.nums | length) as $n | .nums | add / $n", "3.125"},
+            {"[1, [2, [3]]] | flatten", "[1,2,3]"},
+            {"{\"a\": {\"x\": 1}} * {\"a\": {\"y\": 2}}", R"({"a":{"x":1,"y":2}})"},
+            {"[1,2,3,1] - [1]", "[2,3]"},
+            {".svc | map(has(\"port\"))", "[true,true,false]"},
+            {".missing.deeper", "null"},
+            {"[.[]?]  | length", "5"},
+            {".svc[0] | with_entries(select(.value | type == \"number\"))", R"({"port":8080,"n":3})"},
+            {"[.svc[] | .name | ascii_upcase]", R"(["API","DB","CACHE"])"},
+            {"\"10\" | tonumber + 1", "11"},
+            {"[1, null, 2] | map(values)", "[1,2]"},
+            {"$__loc__ | .line", "1"},
+            // old jq-lite spellings keep working
+            {"[0].x", "null"},
+        };
+        int fails = 0;
+        for (const auto& [query, want] : cases) {
+            auto r = jq::run(query, query == std::string_view{"[0].x"} ? oj::array({oj::object()}) : doc);
+            std::string got;
+            if (!r) got = "ERR: " + r.error();
+            else for (std::size_t i = 0; i < r->size(); ++i) got += (i ? "\n" : "") + (*r)[i].dump();
+            if (got != want) {
+                ++fails;
+                std::fprintf(stderr, "jq case failed: %s\n  want: %s\n  got:  %s\n", query, want, got.c_str());
+            }
+        }
+        check(fails == 0, "every jq case matches real jq output");
+
+        // Errors are reported, with the column for syntax errors.
+        auto e1 = jq::run(".a[", doc);
+        check(!e1 && has(e1.error(), "syntax error at col"), "syntax error has a column");
+        auto e2 = jq::run(".nums | join(\",\")", doc);
+        check(e2.has_value(), "join stringifies numbers");
+        auto e3 = jq::run(".text | .foo", doc);
+        check(!e3 && has(e3.error(), "Cannot index string"), "type errors are jq's wording");
+        auto e4 = jq::run("nosuch(1)", doc);
+        check(!e4 && has(e4.error(), "nosuch/1"), "unknown function names its arity");
+        // Resource guards: none of these may hang or exhaust memory.
+        check(!jq::run("[range(1e9)] | length", doc), "huge array is capped");
+        check(!jq::run("reduce range(1e9) as $i (0; . + 1)", doc), "step budget stops runaway loops");
+        check(!jq::run("\"x\" * 1e9", doc), "string blow-up is capped");
+        check(!jq::run("\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!\" | test(\"(a+)+$\")", doc), "ReDoS shape refused");
+        auto many = jq::run("range(50)", doc, 10);
+        check(!many && has(many.error(), "more than 10"), "output cap is enforced");
+        check(jq::run("env | length", doc).value()[0] == 0, "env never leaks the host environment");
+    }
+
+    // ── tool-level: null hint, no-output note, BOM ───────────────────────────
+    {
+        auto r = q(".dependncies.react");   // typo
+        check(!r.is_error && has(r.text, "missing key yields null"), "all-null results explain why");
+        auto e = q(".services[] | select(.port > 99999)");
+        check(!e.is_error && has(e.text, "no output"), "empty result says so");
+        wr(root / "bom.json", "\xEF\xBB\xBF{\"k\": 1}");
+        auto a = obj(); a["path"] = (root / "bom.json").string(); a["query"] = ".k";
+        auto b = call(*provider, "json_query", a);
+        check(!b.is_error && b.text == "1", "a UTF-8 BOM is skipped");
     }
 
     fs::current_path(prev);

@@ -151,7 +151,7 @@ TEST_CASE("fuzzy_match") {
         auto m = fuzzy_find(file,
             "    // init the widget registry\n"
             "    registry.init();\n"
-            "    log.info( \"ready\" );\n");
+            "    log.info( \"ready\" );\n", {}, 1);
         CHECK(m.ok);
         CHECK(m.count == 1);
         CHECK(matched(file, m).find("registry.init();") != std::string_view::npos);

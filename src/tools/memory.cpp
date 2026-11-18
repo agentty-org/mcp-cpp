@@ -61,6 +61,7 @@ struct RememberArgs {
 struct ForgetArgs {
     std::string id;
     std::string substring;
+    std::string scope;     // empty = every scope
     bool        dry_run = false;
 };
 
@@ -136,17 +137,21 @@ void register_memory_tools(Shells& sh, const std::shared_ptr<MemoryStore>& mem) 
     // ── forget ───────────────────────────────────────────────────────────
     auto forget = share(ArgSpec<ForgetArgs>{
         arg(&ForgetArgs::id, "id", "Exact record id."),
-        arg(&ForgetArgs::substring, "substring", "Remove every record whose text contains this."),
+        arg(&ForgetArgs::substring, "substring",
+            "Remove every record whose text contains this (case-insensitive)."),
+        arg(&ForgetArgs::scope, "scope",
+            "Limit a substring forget to one scope (default: every scope).").suggest(scopes),
         arg(&ForgetArgs::dry_run, "dry_run", "Preview substring matches without removing."),
     });
     sh.add(
         "forget",
         "Remove a previously-remembered fact. Provide `id` for an exact "
-        "record, or `substring` to remove every fact containing that text. "
-        "Pass `dry_run:true` with `substring` to preview matches first.",
+        "record, or `substring` to remove every fact containing that text "
+        "(optionally only in `scope`). Pass `dry_run:true` with `substring` "
+        "to preview matches first.",
         forget->schema(),
         EffectSet{},
-        spec_body(forget, [mem](const ForgetArgs& a) -> mcp::cap::Result {
+        spec_body(forget, [mem, known](const ForgetArgs& a) -> mcp::cap::Result {
             if (!a.id.empty()) {
                 auto n = mem->forget_by_id(a.id);
                 return mcp::cap::Result::ok(
@@ -154,19 +159,25 @@ void register_memory_tools(Shells& sh, const std::shared_ptr<MemoryStore>& mem) 
             }
             if (trim(a.substring).empty())
                 return mcp::cap::Result::error("forget: provide `id` or a non-empty `substring`.");
+            if (!a.scope.empty() && !known(a.scope))
+                return mcp::cap::Result::error("forget: unknown scope '" + a.scope + "'.");
 
             const std::string& sub = a.substring;
+            const std::string where = a.scope.empty() ? "" : " in " + a.scope + " scope";
             if (a.dry_run) {
-                auto matches = mem->preview_forget(sub);
-                if (matches.empty())
-                    return mcp::cap::Result::ok("No records match \"" + sub + "\".");
-                std::string out = "Would remove " + std::to_string(matches.size()) + " record(s):\n";
-                for (const auto& m : matches) out += "  [" + m.id + "] " + m.text + "\n";
+                auto matches = mem->preview_forget_in(sub, a.scope);
+                if (!matches)
+                    return mcp::cap::Result::error("forget: this host can't filter by scope.");
+                if (matches->empty())
+                    return mcp::cap::Result::ok("No records match \"" + sub + "\"" + where + ".");
+                std::string out = "Would remove " + std::to_string(matches->size()) + " record(s)" + where + ":\n";
+                for (const auto& m : *matches) out += "  [" + m.id + "] " + m.text + "\n";
                 return mcp::cap::Result::ok(out);
             }
-            auto n = mem->forget_by_substring(sub);
+            auto n = mem->forget_by_substring_in(sub, a.scope);
+            if (!n) return mcp::cap::Result::error("forget: this host can't filter by scope.");
             return mcp::cap::Result::ok(
-                "Forgot " + std::to_string(n) + " record(s) matching \"" + sub + "\".");
+                "Forgot " + std::to_string(*n) + " record(s) matching \"" + sub + "\"" + where + ".");
         }));
 
     // ── wipe_memory ──────────────────────────────────────────────────────

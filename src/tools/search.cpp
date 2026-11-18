@@ -392,7 +392,8 @@ struct GrepArgs {
     std::string pattern;   // non-blank by construction
     std::string root;
     std::string file_glob;
-    bool        case_sensitive = false;
+    bool        case_sensitive = false;   // resolved by check_grep (smart-case)
+    std::optional<bool> case_arg;         // raw `case_sensitive`; nullopt = smart
     bool        word = false;      // whole-word match (absorbs find_references)
     bool        block = false;     // return the whole enclosing function/block per hit
     int         context_lines = kContext;  // ±N lines (context:"N")
@@ -465,7 +466,7 @@ const util::ArgSpec<GrepArgs>& kGrepArgs() {
         util::arg(&GrepArgs::pattern, "pattern", "Regex pattern to search for").required(),
         util::arg(&GrepArgs::root, "path", "Directory to search (default: cwd)"),
         util::arg(&GrepArgs::file_glob, "glob", "Filter files by glob. A bare pattern like `*.cpp` matches the filename anywhere; a slash pattern like `src/*.ts` or `**/test/*.py` matches the workspace-relative path."),
-        util::arg(&GrepArgs::case_sensitive, "case_sensitive", "Case-sensitive match (default: false)"),
+        util::arg(&GrepArgs::case_arg, "case_sensitive", "Omit for smart case: an all-lowercase pattern matches any case, a pattern with an uppercase letter matches exactly. true/false forces it."),
         util::arg(&GrepArgs::word, "word", "Whole-word match: `foo` won't match `foobar` or `do_foo`. Use for finding all USES of an identifier."),
         util::arg(&GrepArgs::context_arg, "context", "`line` (default) = ±2 lines around each hit. `block` = the WHOLE enclosing function/block, so you rarely need a follow-up `read`. A number `0`-`60` = ±N lines (like grep -C N) (use `0` for match lines only — densest content view)."),
         util::arg(&GrepArgs::output_arg, "output", "`content` (default) = matching lines with context. `files` = one path + match-count per line, no line bodies (the survey view: WHICH files touch X). `count` = per-file match counts only (the cheapest probe: HOW WIDESPREAD is X — run this before a bulk rewrite).").suggest({"content", "files", "count"}),
@@ -483,6 +484,20 @@ std::expected<GrepArgs, ToolError> check_grep(GrepArgs g, const util::Bounds&) {
         return std::unexpected(ToolError::invalid_args(
             "pattern must not be blank (received only whitespace)"));
     if (g.offset < 0) g.offset = 0;
+    // Smart case (ripgrep -S, vim smartcase): with no explicit choice, an
+    // all-lowercase pattern is case-insensitive and any uppercase letter makes
+    // the search exact. `HttpClient` then finds the type and not every
+    // `httpclient` mention in comments, while `retry` still finds `Retry`.
+    // Escapes like \W, \S or \D aren't letters the user typed, so skip the
+    // character after a backslash.
+    g.case_sensitive = g.case_arg.value_or([&] {
+        const auto& p = g.pattern;
+        for (std::size_t i = 0; i < p.size(); ++i) {
+            if (p[i] == '\\') { ++i; continue; }
+            if (p[i] >= 'A' && p[i] <= 'Z') return true;
+        }
+        return false;
+    }());
     if (g.context_arg == "block") g.block = true;
     else if (!g.context_arg.empty()
              && g.context_arg.find_first_not_of("0123456789") == std::string::npos)
@@ -935,9 +950,12 @@ std::string grep_no_match_hint(const GrepArgs& a) {
     if (!a.file_glob.empty()) h += " in files matching '" + a.file_glob + "'";
     h += ".";
     std::vector<std::string> tips;
-    if (a.case_sensitive)
-        tips.emplace_back("drop case_sensitive (search is case-insensitive by "
-                          "default) if the casing might differ");
+    if (a.case_sensitive && !a.case_arg.has_value())
+        tips.emplace_back("pass case_sensitive=false — the uppercase letter in the "
+                          "pattern made smart case search exactly");
+    else if (a.case_sensitive)
+        tips.emplace_back("drop case_sensitive (lowercase patterns are "
+                          "case-insensitive by default) if the casing might differ");
     if (!a.file_glob.empty())
         tips.emplace_back("widen or remove `glob` — it may be filtering out the "
                           "files that contain it");
@@ -1623,8 +1641,9 @@ void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "Search for a regex pattern across files. Returns matches grouped by "
         "file with 2 lines of context, each block headed by the enclosing "
         "function/class when detectable (e.g. `### fn foo \xe2\x80\xba L12-14`). "
-        "Paginated 20 results per page (`limit` changes that). Case-insensitive by default; pass "
-        "case_sensitive=true for exact case. Use offset for subsequent pages.",
+        "Paginated 20 results per page (`limit` changes that). Smart case: lowercase patterns are "
+        "case-insensitive, any uppercase letter makes the match exact (override with case_sensitive). "
+        "Use offset for subsequent pages.",
         kGrepArgs().schema(), EffectSet{Effect::ReadFs},
         body<GrepArgs>([exec](const Call& c, const GrepArgs& a) { return run_grep(c, a, exec.get()); }, kGrepArgs(), check_grep), 30'000);
 

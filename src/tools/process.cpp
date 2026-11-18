@@ -16,6 +16,7 @@
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/error.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
+#include "util/child_env.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -112,6 +113,39 @@ Session::Read read_for(const Call& call, Session& s, std::chrono::milliseconds w
 
 }  // namespace
 
+std::expected<StartedProc, std::string>
+start_logged(const Call& call, CallExec& exec, ExecRequest req) {
+    // The full log is the HOST's (ExecRequest::keep_full_log): its pump is
+    // the one thread that sees every byte, so it can write them all without
+    // racing a reader, and this library stays free of threads and file IO
+    // (docs/PROTOCOL_LIBRARIES.md R1/R5). The window read() serves stays
+    // bounded at kRollingBytes; nothing that scrolls out of it is lost.
+    req.max_output_bytes = kRollingBytes;
+    req.keep_full_log    = true;
+    auto started = exec.start(req);
+    if (!started) return std::unexpected(started.error());
+    StartedProc p;
+    p.id      = call.with([](ToolState& s) { return "proc-" + std::to_string(s.next_proc++); });
+    p.log     = (*started)->log_path();
+    p.session = std::move(*started);
+    return p;
+}
+
+void register_proc(const Call& call, const StartedProc& p, const std::string& command) {
+    call.with([&](ToolState& s) {
+        auto e = std::make_shared<state::Proc>();
+        e->id      = p.id;
+        e->command = command;
+        e->session = p.session;
+        e->log     = p.log;
+        s.procs.emplace(p.id, std::move(e));
+    });
+}
+
+void unregister_proc(const Call& call, const std::string& id) {
+    call.with([&](ToolState& s) { s.procs.erase(id); });
+}
+
 namespace {
 
 struct StartArgs { std::string command; std::string cwd = "."; };
@@ -180,13 +214,12 @@ ExecResult run_start(const Call& call, const StartArgs& args, CallExec& exec) {
     ExecRequest req;
     req.program          = {argv.front(), {argv.begin() + 1, argv.end()}};
     if (!args.cwd.empty()) req.cwd = args.cwd;
-    req.max_output_bytes = kRollingBytes;
-    auto started = exec.start(req);
+    req.env              = util::non_interactive_env();
+    auto started = start_logged(call, exec, std::move(req));
     if (!started) return std::unexpected(ToolError::spawn(started.error()));
-    std::shared_ptr<Session> session = std::move(*started);
-    const std::string id = call.with([](ToolState& s) {
-        return "proc-" + std::to_string(s.next_proc++);
-    });
+    std::shared_ptr<Session> session = started->session;
+    const std::string id = started->id;
+    const std::string log_line = started->log.empty() ? std::string{} : "\nlog: " + started->log;
 
     // Give the child a beat to start producing output or crash on the spot.
     // A mistyped command or a busy port otherwise "starts" fine and fails on
@@ -205,6 +238,7 @@ ExecResult run_start(const Call& call, const StartArgs& args, CallExec& exec) {
         if (code) text += " (exit " + std::to_string(*code) + ")";
         text += ": " + args.command;
         text += first.output.empty() ? std::string{"\n(no output)"} : "\n" + first.output;
+        text += log_line;
         // Exit 0 is success: a fast one-shot that finished cleanly isn't
         // something to fix. Only a non-zero or missing code is a failure.
         if (code && *code == 0)
@@ -220,17 +254,11 @@ ExecResult run_start(const Call& call, const StartArgs& args, CallExec& exec) {
         return ToolOutput{std::move(text), std::nullopt};
     }
 
-    call.with([&](ToolState& s) {
-        auto e = std::make_shared<state::Proc>();
-        e->id      = id;
-        e->command = args.command;
-        e->session = session;
-        s.procs.emplace(id, std::move(e));
-    });
+    register_proc(call, *started, args.command);
 
     std::string text = "Started " + id + " (" + id + "): " + args.command
         + "\nStatus: running. Poll with process_poll \"" + id
-        + "\", stop with process_stop.";
+        + "\", stop with process_stop." + log_line;
     if (!first.output.empty()) text += "\n\n" + first.output;
     return ToolOutput{std::move(text), std::nullopt};
 }
@@ -284,8 +312,11 @@ ExecResult run_poll(const Call& call, const PollArgs& args, CallExec&) {
     }
     text += "\n";
     if (r.dropped)
-        text += "[" + std::to_string(r.dropped) + " bytes of earlier output "
-                "scrolled past the buffer before this poll]\n";
+        text += "[" + std::to_string(r.dropped) + " bytes scrolled past this view"
+              + (entry->log.empty() ? std::string{}
+                                    : " \xe2\x80\x94 full log: " + entry->log
+                                      + " (read it with `read` offset/limit)")
+              + "]\n";
     if (!r.output.empty())
         text += r.output;
     else if (r.running)
@@ -298,6 +329,7 @@ ExecResult run_poll(const Call& call, const PollArgs& args, CallExec&) {
                 "or process_stop to force-close and reap)";
     else
         text += "(process has exited; no further output — call process_stop to reap it)";
+    if (!entry->log.empty()) text += "\nlog: " + entry->log;
     return ToolOutput{std::move(text), std::nullopt};
 }
 
@@ -332,6 +364,7 @@ ExecResult run_stop(const Call& call, const StopArgs& args, CallExec&) {
     if (r.dropped)
         text += "\n[" + std::to_string(r.dropped) + " bytes of earlier output were dropped]";
     if (!r.output.empty()) text += "\n" + r.output;
+    if (!entry->log.empty()) text += "\nlog: " + entry->log;
     return ToolOutput{std::move(text), std::nullopt};
 }
 

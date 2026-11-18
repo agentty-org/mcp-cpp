@@ -399,6 +399,52 @@ int main() {
         std::puts("many sessions: ok");
     }
 
+    // ── full log keeps everything, even past the rolling view ───────────
+    {
+        mcp::Json a = mcp::Json::object();
+        a["command"] = "head -c 300000 /dev/zero | tr '\\0' x; echo; echo END";
+        auto r = call(*provider, "process_start", a);
+        auto id = extract_id(r.text);
+        auto lp = r.text.find("log: ");
+        CHECK(lp != std::string::npos);
+        std::string log = lp == std::string::npos ? std::string{}
+            : r.text.substr(lp + 5, r.text.find('\n', lp) - (lp + 5));
+        std::string last;
+        // Generous: under a loaded CI box producing 300 KB through `tr` can
+        // take seconds; the contract is "everything produced is logged".
+        for (int i = 0; i < 120; ++i) {
+            mcp::Json p = mcp::Json::object(); p["id"] = id; p["wait_ms"] = 500;
+            last = call(*provider, "process_poll", p).text;
+            if (contains(last, "exited")) break;
+        }
+        CHECK(contains(last, "exited"));
+        CHECK(contains(last, "log: "));
+        mcp::Json s = mcp::Json::object(); s["id"] = id;
+        auto st = call(*provider, "process_stop", s);
+        CHECK(contains(st.text, "log: "));
+        std::error_code ec;
+        CHECK(!log.empty() && fs::file_size(log, ec) > 200 * 1024);
+        CHECK(((fs::status(log, ec).permissions() & fs::perms::group_all) == fs::perms::none));
+        std::puts("full log: ok");
+    }
+
+    // ── process_start shares the non-interactive env ───────────────────
+    {
+        mcp::Json a = mcp::Json::object();
+        a["command"] = "echo PAGER=$PAGER";
+        auto r = call(*provider, "process_start", a);
+        auto id = extract_id(r.text);
+        std::string all = r.text;
+        for (int i = 0; i < 5 && !contains(all, "PAGER=cat"); ++i) {
+            mcp::Json p = mcp::Json::object(); p["id"] = id; p["wait_ms"] = 300;
+            all += call(*provider, "process_poll", p).text;
+        }
+        CHECK(contains(all, "PAGER=cat"));
+        mcp::Json s = mcp::Json::object(); s["id"] = id;
+        (void)call(*provider, "process_stop", s);
+        std::puts("shared env: ok");
+    }
+
     fs::remove_all(root);
     if (g_failures == 0) std::puts("ALL PASS");
     else std::fprintf(stderr, "%d CHECK(s) FAILED\n", g_failures);

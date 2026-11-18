@@ -129,6 +129,18 @@ void register_task_tool(Shells&, const std::shared_ptr<SubagentRunner>&);
 void register_fs_tools(Shells&);       // read, write, edit, list_dir
 void register_shell_tools(Shells&, const std::shared_ptr<Exec>&);  // shell
 void register_process_tools(Shells&, const std::shared_ptr<Exec>&);  // process_start/poll/stop
+
+// A process session with a full-output log (process.cpp). Shared by
+// process_start and shell's soft timeout.
+struct StartedProc {
+    std::string              id;
+    std::shared_ptr<Session> session;
+    std::string              log;   // may be empty
+};
+[[nodiscard]] std::expected<StartedProc, std::string>
+start_logged(const Call& call, CallExec& exec, ExecRequest req);
+void register_proc(const Call& call, const StartedProc& p, const std::string& command);
+void unregister_proc(const Call& call, const std::string& id);
 void register_search_tools(Shells&, const std::shared_ptr<Exec>&);   // grep, glob, find_definition
 void register_structural_tools(Shells&,
     const std::shared_ptr<DocRetriever>& = nullptr); // search_structural

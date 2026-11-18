@@ -16,6 +16,9 @@
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/error.hpp>
 #include <mcp/tools/util/utf8.hpp>
+#include "call_state.hpp"
+#include "util/child_env.hpp"
+#include <regex>
 
 #include <chrono>
 #include <cstdio>
@@ -53,6 +56,9 @@ struct BashArgs {
     std::string command;      // the script, after normalising
     bool        timeout_given = false;  // caller set timeout/timeout_ms
     std::string cd;        // optional; empty = inherit cwd
+    bool        cd_given = false;   // the caller passed `cd` (beats shell_cwd)
+    bool        kill_on_timeout = false;   // on_timeout="kill"
+    std::string on_timeout_in;
     std::vector<std::pair<std::string, std::string>> env;  // caller overrides
     std::string display_description;
     // Bound the output returned TO THE MODEL without bounding what the USER
@@ -63,7 +69,7 @@ struct BashArgs {
     // the model gets the slice. 0 = unbounded.
     int         head_lines = 0;
     int         tail_lines = 0;
-    int         timeout = 60;   // [1, 300]
+    int         timeout = 60;   // [1, 600]
     std::optional<int> timeout_in, timeout_ms_in;
     json        env_in;
 };
@@ -178,7 +184,14 @@ std::expected<BashArgs, ToolError> check_bash_args(BashArgs a, const util::Bound
     // too-large request to the 60s default — a model asking for 600s wants
     // MORE time, and 60 would time out the very command it was raised for.
     if (timeout_int <= 0) timeout_int = 60;
-    else if (timeout_int > 300) timeout_int = 300;
+    else if (timeout_int > 600) timeout_int = 600;
+
+    if (a.on_timeout_in.empty() || a.on_timeout_in == "background") a.kill_on_timeout = false;
+    else if (a.on_timeout_in == "kill") a.kill_on_timeout = true;
+    else return std::unexpected(ToolError::invalid_args(
+        "on_timeout must be \"background\" or \"kill\""));
+
+    a.cd_given = !a.cd.empty();
 
     std::string cd = std::move(a.cd);
     if (!cd.empty()) {
@@ -372,28 +385,35 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
 
     std::string effective = cmd_str;
     // Real working directory (passed to the child via chdir), NOT a `cd &&`
-    // shell prefix — the path can't be re-parsed/mangled and works even for a
-    // command that isn't shell-wrapped.
-    const std::string& cwd = a.cd;
+    // shell prefix. Without an explicit `cd`, start where the previous call
+    // ended (shell_cwd, validated against the workspace when it was stored).
+    std::string cwd = a.cd;
+    if (!a.cd_given) {
+        auto prev = exec.call().with([](ToolState& s) { return s.shell_cwd; });
+        if (!prev.empty() && exec.call().fs().stat(prev).directory) cwd = prev;
+    }
 
-    // Non-interactive, deterministic child environment. These defaults keep
-    // captured output clean (no ANSI colour to bloat the model's context) and
-    // stop tools from BLOCKING on a tty they'll never get (git credential/
-    // editor prompts, pagers). Model-supplied env (a.env) layers on top and
-    // wins, so a caller can still force colour or a pager if it really wants.
-    std::vector<std::pair<std::string, std::string>> child_env = {
-        {"NO_COLOR", "1"},              // https://no-color.org
-        {"CLICOLOR", "0"},
-        {"CLICOLOR_FORCE", "0"},
-        {"TERM", "dumb"},               // discourages cursor/colour escapes
-        {"PAGER", "cat"},
-        {"GIT_PAGER", "cat"},
-        {"GIT_TERMINAL_PROMPT", "0"},   // never block on a credential prompt
-        {"GIT_OPTIONAL_LOCKS", "0"},
-        {"DEBIAN_FRONTEND", "noninteractive"},
-        {"PYTHONUNBUFFERED", "1"},      // stream python output to the idle watchdog
-    };
-    for (const auto& kv : a.env) child_env.push_back(kv);   // caller overrides win
+    // Persistent cwd: an EXIT trap writes the final directory to a file in
+    // the HOST's scratch dir (all file IO goes through HostServices::files).
+    // A trap (not a suffix) still fires when the script calls `exit`, and the
+    // path is embedded in the script so no output is parsed. The name comes
+    // from the per-session counter in ToolState, not a library static.
+    std::string cwd_file;
+#ifndef _WIN32
+    if (auto scratch = exec.call().fs().scratch_dir(); !scratch.empty()) {
+        const auto n = exec.call().with([](ToolState& s) { return s.next_proc++; });
+        std::error_code ec;
+        exec.call().fs().create_directories(scratch / "shell-cwd", ec);
+        cwd_file = (scratch / "shell-cwd" / ("cwd-" + std::to_string(n))).string();
+        std::string q = "'";
+        for (char c : cwd_file) q += (c == '\'') ? std::string("'\\''") : std::string(1, c);
+        q += "'";
+        effective = "__mcp_cwd_file=" + q
+                  + "; trap 'pwd -P >\"$__mcp_cwd_file\" 2>/dev/null' EXIT\n" + cmd_str;
+    }
+#endif
+    // Non-interactive, deterministic child environment (util/child_env).
+    auto child_env = util::non_interactive_env(a.env);   // caller overrides win
 
     constexpr std::size_t kCaptureCap       = 8u * 1024u * 1024u;
     constexpr std::size_t kModelPreviewBytes = 30000;
@@ -416,7 +436,64 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
     if (a.timeout_given) ereq.budgets.wall = std::chrono::seconds{tmo_s};
     ereq.max_output_bytes = kCaptureCap;
 
-    const auto res = exec.run(ereq);
+    // Soft timeout: run it as a process session from the start, so running
+    // out of time leaves it alive and adoptable instead of dead. Falls back
+    // to the blocking run when the host can't start sessions.
+    tools::ExecResult res;
+    std::optional<StartedProc> bg;   // set: still running, now a session
+    bool ran = false;
+    if (!a.kill_on_timeout) {
+        ExecRequest sreq = ereq;
+        sreq.budgets = {};   // we keep the clocks; the session must outlive them
+        if (auto st = start_logged(exec.call(), exec, std::move(sreq))) {
+            ran = true;
+            // No clock of our own (R4): the session reports its age by the
+            // HOST's clock (Read::uptime), and idleness is counted in empty
+            // 100 ms polls. Both budgets are the timeout in this mode.
+            const auto budget  = std::chrono::seconds{tmo_s};
+            constexpr auto kTick = std::chrono::milliseconds{100};
+            const long idle_ticks_max = static_cast<long>(budget / kTick);
+            long idle_ticks = 0;
+            int  after_exit = 0;   // polls since the exit was seen
+            for (;;) {
+                auto rd = st->session->read(kTick, kCaptureCap);
+                if (!rd.output.empty()) {
+                    idle_ticks = 0;
+                    if (exec.call().progress)
+                        exec.call().progress(util::strip_terminal_controls(rd.output));
+                    const std::size_t room = kCaptureCap - std::min(kCaptureCap, res.output.size());
+                    if (rd.output.size() > room) { rd.output.resize(room); res.truncated = true; }
+                    res.output += rd.output;
+                } else {
+                    ++idle_ticks;
+                }
+                if (rd.dropped) res.truncated = true;
+                res.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(rd.uptime);
+                if (rd.outcome) {
+                    // A background grandchild may hold the pipe open: give
+                    // it a moment (3 polls), then report the exit without EOF.
+                    if (rd.eof || ++after_exit > 3) {
+                        res.outcome = *rd.outcome;
+                        break;
+                    }
+                    continue;
+                }
+                if (exec.call().cancel_requested()) {
+                    st->session->stop();
+                    res.outcome = Cancelled{};
+                    break;
+                }
+                const bool wall = rd.uptime >= budget;
+                if (wall || idle_ticks >= idle_ticks_max) {
+                    res.outcome = TimedOut{wall ? TimedOut::budget::wall : TimedOut::budget::idle};
+                    bg = std::move(*st);
+                    break;
+                }
+            }
+            if (bg) register_proc(exec.call(), *bg, a.command);
+        }
+    }
+    if (!ran) res = exec.run(ereq);
 
     // Shaped like what the rest of this function already reads, so changing
     // the runner underneath did not turn into a rewrite of the formatting.
@@ -532,15 +609,24 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
     };
 
     std::ostringstream out;
-    if (r.timed_out) {
+    if (r.timed_out && bg) {
+        if (r.output.empty())
+            out << "Command \"" << a.command << "\" produced no output yet.";
+        else
+            out << "Output so far:\n\n" << fence(r.output);
+        out << "\n\n[still running as background session " << bg->id << " after "
+            << a.timeout << "s \xe2\x80\x94 poll with process_poll id=" << bg->id
+            << " (use wait_ms), stop with process_stop."
+            << (bg->log.empty() ? std::string{} : " Full log: " + bg->log) << "]";
+    } else if (r.timed_out) {
         // Teach the recovery path: a bare "timed out" invites re-running the
         // same command with the same deadline.
         const char* next_step =
-            (a.timeout < 300)
+            (a.timeout < 600)
                 ? "\n\nIf the command needs more time, retry with a larger "
-                  "`timeout` (max 300s); for servers/watchers that never "
+                  "`timeout` (max 600s) or on_timeout=\"background\"; for servers/watchers that never "
                   "exit, use process_start instead."
-                : "\n\nThis was already the maximum timeout (300s); for "
+                : "\n\nThis was already the maximum timeout (600s); for "
                   "long builds or servers, use process_start and poll it.";
         if (r.output.empty()) {
             out << "Command \"" << a.command << "\" timed out after "
@@ -597,6 +683,51 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
                    + std::to_string((elapsed_ms % 1000) / 100) + " s"))
             << "]";
 
+    // E: a prompt nobody can answer.
+    if (r.timed_out || r.exit_code != 0) {
+        const std::string& raw = res.output;
+        std::size_t end = raw.find_last_not_of(" \t\r\n");
+        if (end != std::string::npos) {
+            std::size_t start = raw.rfind('\n', end);
+            std::string last = raw.substr(start == std::string::npos ? 0 : start + 1,
+                                          end + 1 - (start == std::string::npos ? 0 : start + 1));
+            static const std::regex kPrompt(
+                R"(\[y/n\]|\(y/n\)|\(yes/no\)|password:|passphrase|continue\?|press any key|are you sure)",
+                std::regex::icase);
+            if (std::regex_search(last, kPrompt))
+                out << "\n\n[the command appears to be waiting for input; stdin is /dev/null "
+                       "\xe2\x80\x94 pass a non-interactive flag (e.g. -y, --yes, --no-input) "
+                       "or pipe the answer]";
+        }
+    }
+    // F: a pipe into tail/head/grep holds everything until EOF.
+    if (r.timed_out && r.output.empty()) {
+        static const std::regex kPipe(R"(\|\s*(tail|head|grep)\b)");
+        if (std::regex_search(a.command, kPipe))
+            out << "\n\n[output was buffered by the pipe until EOF; use the tool's "
+                   "tail_lines/head_lines parameters instead of piping]";
+    }
+    // D: remember where the script ended up.
+    if (!cwd_file.empty()) {
+        std::string dir;
+        if (!bg) {
+            auto& files = exec.call().fs();
+            if (auto txt = files.read(cwd_file)) dir = txt->substr(0, txt->find('\n'));
+            std::error_code ec;
+            files.remove(cwd_file, ec);
+        }
+        if (!dir.empty() && !r.timed_out && dir != cwd) {
+            auto b = detail::bounds(exec.call());
+            auto wp = util::make_workspace_path_checked(dir, "shell", b);
+            if (wp && exec.call().fs().stat(wp->path()).directory) {
+                const std::string now = wp->string();
+                const std::string base = cwd.empty() ? exec.call().fs().cwd().string() : cwd;
+                exec.call().with([&](ToolState& s) { s.shell_cwd = now; });
+                if (now != base) out << "\n\n[cwd is now " << now << "]";
+            }
+        }
+    }
+
     std::string body = out.str();
     // Advisory only: the command already ran. The tip names the PARAMETER
     // that replaces the shell idiom (limit:20, offset:-50, head_lines), not
@@ -620,7 +751,14 @@ const util::ArgSpec<BashArgs>& kBashArgs() {
                     "Working directory to run the command in (a real chdir in the "
                     "child, so relative paths and the command's own $PWD are "
                     "correct). Must be an existing directory inside the workspace. "
-                    "Use this instead of starting the command with `cd dir &&`."),
+                    "Use this instead of starting the command with `cd dir &&`. "
+                    "Without it, the command starts in the directory the previous "
+                    "shell call ended in (if inside the workspace); env vars do "
+                    "NOT persist between calls."),
+            util::arg(&BashArgs::on_timeout_in, "on_timeout",
+                    "What happens when the timeout elapses: \"background\" (default) "
+                    "keeps the command running as a process session you can "
+                    "process_poll/process_stop; \"kill\" stops it."),
             util::arg(&BashArgs::env_in, "env",
                     "Extra environment variables for THIS command, e.g. "
                     "{\"CI\":\"1\",\"RUST_LOG\":\"debug\"}. Layered on top of the "
@@ -629,7 +767,7 @@ const util::ArgSpec<BashArgs>& kBashArgs() {
                     "GIT_TERMINAL_PROMPT=0, TERM=dumb, …) so output is quiet and "
                     "nothing blocks on a prompt — only set this to add/override.")
                 .shape(json{{"type","object"}, {"additionalProperties", {{"type","string"}}}}),
-            util::arg(&BashArgs::timeout_in, "timeout", "Timeout in seconds (max 300). If set, the command is stopped after this long even while it's still printing. If omitted, it's stopped after 60s of silence."),
+            util::arg(&BashArgs::timeout_in, "timeout", "Timeout in seconds (max 600). Applies to silence and to total time; on expiry the command keeps running in the background (see on_timeout). If omitted, 60s."),
             util::arg(&BashArgs::timeout_ms_in, "timeout_ms",
                     "Alternative timeout in milliseconds (rounded up to seconds)."),
             util::arg(&BashArgs::head_lines, "head_lines",

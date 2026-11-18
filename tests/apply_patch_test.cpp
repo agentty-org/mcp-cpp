@@ -6,6 +6,7 @@
 // hunk writes nothing), ambiguity rejection, and the FileChange carry.
 
 #include <chrono>
+#include <thread>
 #include "support/disk_files.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
@@ -217,6 +218,119 @@ TEST_CASE("apply_patch") {
               "rejection names the hunk cap");
         check(ms < 1'000, "over-cap patch is rejected fast, not ground through");
         check(rd(root / "many.txt") == base, "ATOMIC: nothing written on reject");
+    }
+
+    // ── run_edit Match reporting / refusals ──────────────────────────────
+    auto check = [](bool ok, const char* what) { CHECK_MESSAGE(ok, std::string(what)); };
+    auto edit1 = [&](const fs::path& p, std::string o, std::string n,
+                     bool all = false) {
+        auto a = obj();
+        a["path"] = p.string();
+        auto e = obj(); e["old_text"] = o; e["new_text"] = n;
+        if (all) e["replace_all"] = true;
+        a["edits"] = mcp::Json::array({e});
+        return call(*provider, "edit", a);
+    };
+    {
+        wr(root / "m.txt", base);
+        auto r = edit1(root / "m.txt", "line two\n", "line 2\n");
+        check(!r.is_error && has(r.text, "Match:") && has(r.text, "exact"),
+              "exact edit reports its strategy");
+        wr(root / "m2.txt", "fn() {\n        a = 1;\n        b = 2;\n}\n");
+        auto r2 = edit1(root / "m2.txt", "    a = 1;\n    b = 2;\n", "    a = 3;\n    b = 2;\n");
+        check(!r2.is_error && has(r2.text, "\xe2\x9a\xa0"),
+              "indent-relative edit carries a warning");
+        wr(root / "m3.txt", base);
+        auto r3 = edit1(root / "m3.txt", "line  tw0\n", "X\n", true);
+        check(r3.is_error && rd(root / "m3.txt") == base, "replace_all refuses a near-miss");
+        auto a = obj();
+        a["path"] = (root / "m3.txt").string();
+        auto e1 = obj(); e1["old_text"] = "line one\nline two\n"; e1["new_text"] = "A\n";
+        auto e2 = obj(); e2["old_text"] = "line two\nline three\n"; e2["new_text"] = "B\n";
+        a["edits"] = mcp::Json::array({e1, e2});
+        auto r4 = call(*provider, "edit", a);
+        check(has(r4.text, "1 failed") && !has(rd(root / "m3.txt"), "B\n"),
+              "overlapping edit refused");
+    }
+
+    // ── stale + fuzzy refused, stale + exact applied ─────────────────────
+    {
+        wr(root / "s.txt", base);
+        auto rr = obj(); rr["path"] = (root / "s.txt").string();
+        (void)call(*provider, "read", rr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        wr(root / "s.txt", base + "line six\n");
+        fs::last_write_time(root / "s.txt", fs::file_time_type::clock::now() + std::chrono::seconds(5));
+        auto a = obj(); a["path"] = (root / "s.txt").string();
+        a["patch"] = "@@ -1,2 +1,2 @@\n line onee\n-line two\n+FUZZ\n line three\n";
+        auto r = call(*provider, "apply_patch", a);
+        check(r.is_error && !has(rd(root / "s.txt"), "FUZZ"), "stale + fuzzy refused");
+        a["patch"] = "@@ -1,2 +1,2 @@\n line one\n-line two\n+EXACT\n line three\n";
+        auto r2 = call(*provider, "apply_patch", a);
+        check(!r2.is_error && has(rd(root / "s.txt"), "EXACT"), "stale + exact applied");
+    }
+
+    // ── CRLF dominance, BOM, no-newline-at-EOF ───────────────────────────
+    {
+        wr(root / "crlf.txt", "a\r\nb\r\nc\nd\r\ne\r\n");
+        auto a = obj(); a["path"] = (root / "crlf.txt").string();
+        a["patch"] = "@@ -1,2 +1,2 @@\n a\n-b\n+B\n";
+        auto r = call(*provider, "apply_patch", a);
+        check(!r.is_error && rd(root / "crlf.txt") == "a\r\nB\r\nc\nd\r\ne\r\n",
+              "CRLF-dominant file keeps CRLF");
+        check(has(r.text, "Match:"), "apply_patch reports match strategy");
+
+        wr(root / "bom.txt", "\xEF\xBB\xBFx\ny\n");
+        a["path"] = (root / "bom.txt").string();
+        a["patch"] = "@@ -1,2 +1,2 @@\n x\n-y\n+Y\n";
+        check(!call(*provider, "apply_patch", a).is_error
+              && rd(root / "bom.txt") == "\xEF\xBB\xBFx\nY\n", "BOM preserved");
+
+        wr(root / "eol.txt", "x\ny");
+        a["path"] = (root / "eol.txt").string();
+        a["patch"] = "@@ -1,2 +1,2 @@\n x\n-y\n\\ No newline at end of file\n+Y\n";
+        auto r3 = call(*provider, "apply_patch", a);
+        check(!r3.is_error && rd(root / "eol.txt") == "x\nY\n", "no-EOL marker honoured");
+        wr(root / "eol2.txt", "x\ny");
+        a["path"] = (root / "eol2.txt").string();
+        a["patch"] = "@@ -1,2 +1,2 @@\n x\n-y\n+Y\n";
+        check(!call(*provider, "apply_patch", a).is_error
+              && rd(root / "eol2.txt") == "x\nY", "trailing-newline state preserved");
+    }
+
+    // ── multi-file: V4A + unified ────────────────────────────────────────
+    {
+        wr(root / "u1.txt", base); wr(root / "mv.txt", base); wr(root / "del.txt", "bye\n");
+        auto a = obj();
+        a["patch"] = "*** Begin Patch\n"
+                     "*** Add File: new.txt\n+hello\n+world\n"
+                     "*** Update File: u1.txt\n@@\n line one\n-line two\n+LINE2\n"
+                     "*** Update File: mv.txt\n*** Move to: moved.txt\n@@\n line four\n-line five\n+FIVE\n"
+                     "*** Delete File: del.txt\n"
+                     "*** End Patch\n";
+        auto r = call(*provider, "apply_patch", a);
+        check(!r.is_error, "V4A applies");
+        check(rd(root / "new.txt") == "hello\nworld\n", "V4A add");
+        check(has(rd(root / "u1.txt"), "LINE2"), "V4A update");
+        check(!fs::exists(root / "mv.txt") && has(rd(root / "moved.txt"), "FIVE"), "V4A move");
+        check(!fs::exists(root / "del.txt"), "V4A delete");
+        check(has(r.text, "Added") && has(r.text, "Moved") && has(r.text, "Deleted"), "summary");
+
+        wr(root / "f1.txt", base); wr(root / "f2.txt", base);
+        a["patch"] = "*** Begin Patch\n"
+                     "*** Update File: f1.txt\n@@\n line one\n-line two\n+CHANGED\n"
+                     "*** Add File: added.txt\n+x\n"
+                     "*** Update File: f2.txt\n@@\n-no such line here at all\n+Z\n"
+                     "*** End Patch\n";
+        auto r2 = call(*provider, "apply_patch", a);
+        check(r2.is_error && has(r2.text, "f2.txt"), "failing op named");
+        check(rd(root / "f1.txt") == base && !fs::exists(root / "added.txt"), "nothing written");
+
+        a["patch"] = "--- a/f1.txt\n+++ b/f1.txt\n@@ -1,2 +1,2 @@\n line one\n-line two\n+U1\n"
+                     "--- /dev/null\n+++ b/uadd.txt\n@@ -0,0 +1 @@\n+fresh\n";
+        auto r3 = call(*provider, "apply_patch", a);
+        check(!r3.is_error && has(rd(root / "f1.txt"), "U1")
+              && rd(root / "uadd.txt") == "fresh\n", "multi-file unified diff");
     }
 
     fs::current_path(prev);

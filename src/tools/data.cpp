@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// data.cpp — register_data_tools: json_query, a jq-lite for structured data.
+// data.cpp — register_data_tools: json_query, jq over structured data.
 //
 // grep/extract are line-oriented and blind to structure; a config or data
-// file wants a PATH query, not a regex. json_query evaluates a dotted jq-style
-// path over a JSON document (a `.json` file, or inline `json`) and returns the
-// selected value(s) — `.scripts | keys`, `.dependencies.react`,
-// `[].name`, `.services[2].port`. JSON only (the format the toolset already
-// parses); YAML/TOML would need a new parser dependency.
+// file wants a PATH query, not a regex. json_query runs a jq program (the
+// real language, see util/jq.hpp: paths, select/map, `..`, `//`, `?`,
+// reduce, regex, @formats, ~110 builtins) over a JSON document (a `.json`
+// file, or inline `json`). Key order is preserved, as in jq. JSON only;
+// YAML/TOML would need a new parser dependency.
 
 #include "tool_body.hpp"
 #include "tool_shell.hpp"
 #include "call_state.hpp"
+#include "util/jq.hpp"
 
 #include <mcp/tools/util/error.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
@@ -19,7 +20,6 @@
 #include <mcp/tools/util/utf8.hpp>
 
 #include <algorithm>
-#include <deque>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -32,189 +32,11 @@ namespace fs = std::filesystem;
 using util::ToolError;
 using util::ExecResult;
 using util::ToolOutput;
-using json = nlohmann::json;
+using ojson = nlohmann::ordered_json;
 
 constexpr std::size_t kMaxOutputBytes = 20'000;
-constexpr int         kMaxResults     = 2000;
-
-// One step in a parsed path.
-struct Step {
-    enum class Kind { Key, Index, Slice, Iterate,
-                      Keys, Values, Length, Type, Has } kind;
-    std::string key;        // Key / Has
-    long        i = 0;       // Index / Slice.lo
-    long        j = 0;       // Slice.hi
-    bool        j_set = false;
-};
-
-// Parse a jq-lite path into steps. Grammar:
-//   .key            object member (bareword: [A-Za-z0-9_-])
-//   .["key"]        quoted member (any chars)
-//   ["key"]         same, leading form
-//   [i]             array index (negative counts from end)
-//   [lo:hi]         array slice (either bound optional)
-//   []              iterate array/object values
-//   | keys | values | length | type | has(x)   pipeline verbs
-// A leading "." (identity) selects the whole document.
-[[nodiscard]] std::vector<Step> parse_path(std::string_view p, std::string& err) {
-    std::vector<Step> out;
-    std::size_t i = 0;
-    auto skip_ws = [&] { while (i < p.size() && std::isspace((unsigned char)p[i])) ++i; };
-
-    skip_ws();
-    while (i < p.size()) {
-        skip_ws();
-        if (i >= p.size()) break;
-        char c = p[i];
-
-        // A bareword verb at the START of a path (or after a `|`) is a
-        // top-level filter: `has("k")`, `keys`, `length`, `type`, `values`.
-        // jq treats these as standalone filters, so accept them without a
-        // leading `.`/`|`. We detect a letter that isn't part of `.key`.
-        if (c == '|' || std::isalpha((unsigned char)c)) {
-            if (c == '|') { ++i; skip_ws(); }
-            // pipeline verb
-            std::size_t s = i;
-            while (i < p.size() && (std::isalpha((unsigned char)p[i]))) ++i;
-            std::string verb{p.substr(s, i - s)};
-            if      (verb == "keys")   out.push_back({Step::Kind::Keys});
-            else if (verb == "values") out.push_back({Step::Kind::Values});
-            else if (verb == "length") out.push_back({Step::Kind::Length});
-            else if (verb == "type")   out.push_back({Step::Kind::Type});
-            else if (verb == "has") {
-                skip_ws();
-                if (i >= p.size() || p[i] != '(') { err = "has() needs an argument"; return {}; }
-                ++i; std::size_t a = i;
-                while (i < p.size() && p[i] != ')') ++i;
-                std::string arg{p.substr(a, i - a)};
-                if (i < p.size()) ++i;  // consume ')'
-                // strip optional quotes
-                if (arg.size() >= 2 && (arg.front()=='"'||arg.front()=='\'')) arg = arg.substr(1, arg.size()-2);
-                out.push_back({Step::Kind::Has, arg});
-            }
-            else { err = "unknown pipeline verb `" + verb + "` (keys|values|length|type|has)"; return {}; }
-            continue;
-        }
-
-        if (c == '.') {
-            ++i;
-            if (i >= p.size()) break;               // trailing dot / identity
-            if (p[i] == '[') continue;              // .[ … ] handled below
-            if (p[i] == '"') {                      // .["x"]  is [ form; ."x" also
-                ++i; std::size_t s = i;
-                while (i < p.size() && p[i] != '"') ++i;
-                out.push_back({Step::Kind::Key, std::string{p.substr(s, i - s)}});
-                if (i < p.size()) ++i;
-                continue;
-            }
-            std::size_t s = i;
-            while (i < p.size() && (std::isalnum((unsigned char)p[i]) || p[i]=='_' || p[i]=='-')) ++i;
-            if (i == s) { err = "empty key after '.'"; return {}; }
-            out.push_back({Step::Kind::Key, std::string{p.substr(s, i - s)}});
-            continue;
-        }
-
-        if (c == '[') {
-            ++i; skip_ws();
-            if (i < p.size() && p[i] == ']') { ++i; out.push_back({Step::Kind::Iterate}); continue; }
-            if (i < p.size() && (p[i]=='"' || p[i]=='\'')) {   // ["key"]
-                char q = p[i]; ++i; std::size_t s = i;
-                while (i < p.size() && p[i] != q) ++i;
-                out.push_back({Step::Kind::Key, std::string{p.substr(s, i - s)}});
-                if (i < p.size()) ++i;
-                skip_ws(); if (i < p.size() && p[i]==']') ++i;
-                continue;
-            }
-            // numeric index or slice
-            std::size_t s = i;
-            while (i < p.size() && p[i] != ']') ++i;
-            std::string body{p.substr(s, i - s)};
-            if (i < p.size()) ++i;  // ']'
-            auto colon = body.find(':');
-            if (colon == std::string::npos) {
-                try { out.push_back({Step::Kind::Index, "", std::stol(body)}); }
-                catch (...) { err = "bad array index `" + body + "`"; return {}; }
-            } else {
-                Step st{Step::Kind::Slice};
-                std::string lo = body.substr(0, colon), hi = body.substr(colon+1);
-                try {
-                    st.i = lo.empty() ? 0 : std::stol(lo);
-                    if (!hi.empty()) { st.j = std::stol(hi); st.j_set = true; }
-                } catch (...) { err = "bad slice `" + body + "`"; return {}; }
-                out.push_back(st);
-            }
-            continue;
-        }
-
-        err = std::string("unexpected character '") + c + "' in path";
-        return {};
-    }
-    return out;
-}
-
-// Apply one step to a set of values, producing the next set.
-[[nodiscard]] bool apply_step(const Step& st, std::vector<const json*>& cur,
-                              std::deque<json>& owned, std::string& err) {
-    std::vector<const json*> next;
-    auto keep = [&](const json& v) { owned.push_back(v); next.push_back(&owned.back()); };
-
-    for (const json* vp : cur) {
-        const json& v = *vp;
-        switch (st.kind) {
-        case Step::Kind::Key:
-            if (!v.is_object()) { err = "`." + st.key + "` on a non-object ("
-                                        + std::string(v.type_name()) + ")"; return false; }
-            if (auto it = v.find(st.key); it != v.end()) next.push_back(&*it);
-            // missing key → drops out (jq yields null; we omit for brevity)
-            break;
-        case Step::Kind::Index: {
-            if (!v.is_array()) { err = "index on a non-array"; return false; }
-            long n = (long)v.size(); long idx = st.i < 0 ? n + st.i : st.i;
-            if (idx >= 0 && idx < n) next.push_back(&v[(std::size_t)idx]);
-            break; }
-        case Step::Kind::Slice: {
-            if (!v.is_array()) { err = "slice on a non-array"; return false; }
-            long n = (long)v.size();
-            long lo = st.i < 0 ? n + st.i : st.i;
-            long hi = st.j_set ? (st.j < 0 ? n + st.j : st.j) : n;
-            lo = std::clamp(lo, 0L, n); hi = std::clamp(hi, 0L, n);
-            // jq semantics: a slice is ONE array value, not a stream of
-            // elements (so `[0:2] | length` == 2, not two `2`s).
-            json sub = json::array();
-            for (long k = lo; k < hi; ++k) sub.push_back(v[(std::size_t)k]);
-            keep(std::move(sub));
-            break; }
-        case Step::Kind::Iterate:
-            if (v.is_array())       for (const auto& e : v) next.push_back(&e);
-            else if (v.is_object()) for (const auto& e : v.items()) next.push_back(&e.value());
-            else { err = "[] on a non-container"; return false; }
-            break;
-        case Step::Kind::Keys: {
-            json arr = json::array();
-            if (v.is_object())      for (auto& e : v.items()) arr.push_back(e.key());
-            else if (v.is_array())  for (std::size_t k=0;k<v.size();++k) arr.push_back((long)k);
-            else { err = "keys on a non-container"; return false; }
-            keep(arr); break; }
-        case Step::Kind::Values: {
-            json arr = json::array();
-            if (v.is_object())      for (auto& e : v.items()) arr.push_back(e.value());
-            else if (v.is_array())  arr = v;
-            else { err = "values on a non-container"; return false; }
-            keep(arr); break; }
-        case Step::Kind::Length: {
-            long len = v.is_string() ? (long)v.get<std::string>().size()
-                     : v.is_array() || v.is_object() ? (long)v.size()
-                     : v.is_null() ? 0 : 1;
-            keep(json(len)); break; }
-        case Step::Kind::Type:
-            keep(json(v.type_name())); break;
-        case Step::Kind::Has:
-            keep(json(v.is_object() && v.contains(st.key))); break;
-        }
-    }
-    cur = std::move(next);
-    return true;
-}
+constexpr std::size_t kMaxResults     = 2000;    // shown
+constexpr std::size_t kMaxEvaluated   = 100'000; // produced before we stop
 
 struct QueryArgs {
     std::string path;      // file path (mutually exclusive-ish with json_text)
@@ -230,7 +52,10 @@ const util::ArgSpec<QueryArgs>& kQueryArgs() {
         util::arg(&QueryArgs::display_description, "display_description",
                   "One-line summary shown in the UI. Optional."),
         util::arg(&QueryArgs::query, "query",
-                  "jq-lite path: `.` (whole doc), `.key`, `.[\"key with space\"]`, `[i]` (negative = from end), `[lo:hi]` slice, `[]` iterate, and pipeline verbs `| keys | values | length | type | has(k)`. E.g. `.scripts | keys`, `.dependencies.react`, `.services[].name`."),
+                  "A jq program (default `.`). E.g. `.dependencies.react`, `.services[].port`, "
+                  "`.scripts | keys`, `.items | map(select(.ok and .n > 2)) | length`, "
+                  "`[.. | .port? // empty]`, `.deps | to_entries | map(select(.value | startswith(\"^\"))) | map(.key)`, "
+                  "`group_by(.kind) | map({kind: .[0].kind, n: length})`, `\"\\(.name)@\\(.version)\"`."),
         util::arg(&QueryArgs::path, "path", "A .json file to query. Provide this OR inline `json`."),
         util::arg(&QueryArgs::json_text, "json", "Inline JSON to query instead of a file."),
         util::arg(&QueryArgs::raw, "raw", "Print string results unquoted (jq -r)."),
@@ -249,62 +74,77 @@ std::expected<QueryArgs, ToolError> check_query(QueryArgs a, const util::Bounds&
     return a;
 }
 
+// The most common dead end: a typo'd key yields `null` (jq semantics), and
+// the model reads that as "the value is null". Name the likely cause.
+std::string null_hint(const std::string& query, const std::vector<ojson>& outs) {
+    if (outs.empty() || !std::ranges::all_of(outs, [](const ojson& v) { return v.is_null(); }))
+        return {};
+    if (query.find('.') == std::string::npos) return {};
+    return "\n(every result is null: in jq a missing key yields null. Check the "
+           "spelling with `keys`, or `has(\"k\")`.)";
+}
+
 ExecResult run_json_query(const Call& call, const QueryArgs& a) {
     std::string text;
     if (!a.path.empty()) {
         auto wp = util::make_readable_path_checked(a.path, "json_query", bounds(call));
         if (!wp) return std::unexpected(std::move(wp.error()));
         const auto& p = wp->path();
-        std::error_code ec;
-        if (!call.fs().stat(p).exists)  return std::unexpected(ToolError::not_found(wp->string()));
-        if (!call.fs().stat(p).regular) return std::unexpected(ToolError::not_a_file(wp->string()));
-        if (auto sz = call.fs().stat(p).size; !ec && sz > 16u*1024u*1024u)
+        const auto st = call.fs().stat(p);
+        if (!st.exists)  return std::unexpected(ToolError::not_found(wp->string()));
+        if (!st.regular) return std::unexpected(ToolError::not_a_file(wp->string()));
+        if (st.size > 16u*1024u*1024u)
             return std::unexpected(ToolError::too_large("file > 16 MiB"));
         try { text = util::read_file(*wp); }
         catch (...) { return std::unexpected(ToolError::io("cannot read " + wp->string())); }
     } else {
         text = a.json_text;
     }
+    // A BOM is common in Windows-saved JSON and is not JSON; skip it.
+    const bool had_bom = text.starts_with("\xEF\xBB\xBF");
+    std::string_view body_text = text;
+    if (had_bom) body_text.remove_prefix(3);
 
-    json doc;
-    try { doc = json::parse(text); }
-    catch (const json::parse_error& e) {
+    ojson doc;
+    try { doc = ojson::parse(body_text); }
+    catch (const ojson::parse_error& e) {
         // nlohmann's what() is "[json.exception.parse_error.101] parse error at
         // line 1, column 4: syntax error ..."; keep the useful middle.
         std::string why = e.what();
         if (auto p = why.find("] "); p != std::string::npos) why.erase(0, p + 2);
-        if (text.starts_with("\xEF\xBB\xBF")) why += " (the file starts with a UTF-8 BOM)";
         return std::unexpected(ToolError::invalid_args("not valid JSON: " + why));
     }
 
-    std::string perr;
-    auto steps = parse_path(a.query, perr);
-    if (!perr.empty())
+    auto outs = util::jq::run(a.query, doc, kMaxEvaluated);
+    if (!outs)
         return std::unexpected(ToolError::invalid_args(
-            "bad query `" + a.query + "`: " + perr));
+            "query `" + a.query + "` failed — " + outs.error()));
 
-    std::deque<json> owned;
-    std::vector<const json*> cur{&doc};
-    std::string err;
-    for (const auto& st : steps)
-        if (!apply_step(st, cur, owned, err))
-            return std::unexpected(ToolError::invalid_args(
-                "query `" + a.query + "`: " + err));
-
-    if (cur.empty())
-        return ToolOutput{"(no match \u2014 the path selected nothing)", std::nullopt};
+    if (outs->empty())
+        return ToolOutput{"(no output \u2014 the query produced no results, e.g. `select` "
+                          "filtered everything or `.[]` iterated an empty container)",
+                          std::nullopt};
 
     std::ostringstream out;
-    int shown = 0;
-    for (const json* vp : cur) {
-        if (shown++ >= kMaxResults) { out << "\u2026 " << (cur.size()-kMaxResults)
-                                          << " more results\n"; break; }
-        if (a.raw && vp->is_string()) out << vp->get<std::string>() << "\n";
-        else out << (a.compact ? vp->dump() : vp->dump(2)) << "\n";
-        if ((std::size_t)out.tellp() >= kMaxOutputBytes) { out << "[capped]\n"; break; }
+    std::size_t shown = 0;
+    for (const auto& v : *outs) {
+        if (shown++ >= kMaxResults) {
+            out << "\u2026 " << (outs->size() - kMaxResults) << " more results "
+                   "(narrow the query, or wrap it in `[ ... ] | length`)\n";
+            break;
+        }
+        if (a.raw && v.is_string()) out << v.get<std::string>() << "\n";
+        else out << (a.compact ? v.dump(-1, ' ', false, ojson::error_handler_t::replace)
+                               : v.dump(2, ' ', false, ojson::error_handler_t::replace)) << "\n";
+        if (static_cast<std::size_t>(out.tellp()) >= kMaxOutputBytes) {
+            out << "[capped at " << kMaxOutputBytes << " bytes after " << shown << " of "
+                << outs->size() << " results]\n";
+            break;
+        }
     }
     std::string body = out.str();
     if (!body.empty() && body.back() == '\n') body.pop_back();
+    body += null_hint(a.query, *outs);
     return ToolOutput{util::to_valid_utf8(std::move(body)), std::nullopt};
 }
 
@@ -313,15 +153,20 @@ ExecResult run_json_query(const Call& call, const QueryArgs& a) {
 void register_data_tools(Shells& sh) {
     sh.add("json_query",
         "USE WHEN you need a value OUT of a .json file (package.json, tsconfig, "
-        "compile_commands.json, an API fixture, an MCP config) — query it by "
-        "PATH instead of `read`-ing the whole file and eyeballing it, or "
-        "grep-ing blind to structure. A jq-lite: point it at a `.json` file (or "
-        "inline `json`) and a jq-style `query` — `.dependencies.react`, "
-        "`.services[].port`, `.scripts | keys`, `.compilerOptions.paths`, "
-        "`[0].id`. Supports `.key`, `[i]` (negative from end), `[lo:hi]` slices, "
-        "`[]` iteration, and `| keys | values | length | type | has(k)`. Each "
-        "result prints as one compact JSON line (`raw:true` unquotes strings). "
-        "JSON only.",
+        "compile_commands.json, an API fixture, an MCP config) — query it with jq "
+        "instead of `read`-ing the whole file and eyeballing it, or grep-ing blind "
+        "to structure. Point it at a `.json` file (or inline `json`) and a jq "
+        "program. Real jq: `.a.b`, `.[i]`/`.[lo:hi]` (negative from end), `.[]`, "
+        "`..`, `?`, `//`, `|`, `,`, arithmetic/comparison, `and`/`or`/`not`, "
+        "`if`/`elif`/`else`, `try`/`catch`, `reduce`/`foreach`, `E as $x | …`, "
+        "`{…}`/`[…]` construction, string interpolation, @csv/@tsv/@json/@sh/@uri/"
+        "@base64, assignment (`=`, `|=`, `+=`, `//=`), and builtins incl. map, "
+        "select, keys, has, length, to_entries/from_entries/with_entries, sort_by, "
+        "group_by, unique_by, min_by/max_by, add, any/all, flatten, paths, del, "
+        "pick, walk, limit/first/last, range, split/join, test/match/capture/sub/"
+        "gsub, ascii_downcase, tostring/tonumber, INDEX/IN. Not supported: `def`, "
+        "`label`, destructuring, dates, `$ENV`. Each result prints as one compact "
+        "JSON line (`raw:true` unquotes strings). JSON only.",
         kQueryArgs().schema(), EffectSet{Effect::ReadFs},
         body<QueryArgs>(run_json_query, kQueryArgs(), check_query), 25'000);
 }

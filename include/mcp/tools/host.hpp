@@ -112,6 +112,19 @@ public:
     // Preview a substring forget without mutating. Returns the matches.
     [[nodiscard]] virtual std::vector<MemoryRecord>
         preview_forget(const std::string& needle) = 0;
+    // Scoped variants: `scope` empty = every scope. Hosts that can filter
+    // override these; the defaults keep older hosts compiling and refuse a
+    // scope they can't honour rather than silently widening it.
+    [[nodiscard]] virtual std::optional<std::size_t>
+        forget_by_substring_in(const std::string& needle, const std::string& scope) {
+        if (!scope.empty()) return std::nullopt;
+        return forget_by_substring(needle);
+    }
+    [[nodiscard]] virtual std::optional<std::vector<MemoryRecord>>
+        preview_forget_in(const std::string& needle, const std::string& scope) {
+        if (!scope.empty()) return std::nullopt;
+        return preview_forget(needle);
+    }
 
     // Preview an entire scope without mutating. Returns the exact record count,
     // or nullopt if the scope is unresolvable.
@@ -313,6 +326,11 @@ struct ExecRequest {
     std::vector<std::pair<std::string, std::string>> env;   // layered on top
     Budgets                  budgets;
     std::optional<std::size_t> max_output_bytes;
+    /// Background sessions only: ask the host to append EVERY byte of
+    /// output to a private log file (0600, capped), independent of the
+    /// bounded window read() serves. The library never touches the file; it
+    /// only shows the model the path the session reports (Session::log_path).
+    bool                     keep_full_log = false;
 
     // No progress sink and no cancellation probe in the request. Both
     // describe the tool CALL, not the program, and the call already carries
@@ -430,6 +448,10 @@ struct Session {
 
     /// Ask it to stop, then insist. Returns at once. Idempotent.
     virtual void stop() noexcept = 0;
+
+    /// Where the host is keeping this session's complete output, when the
+    /// request asked for it (ExecRequest::keep_full_log). Empty: no log.
+    [[nodiscard]] virtual std::string log_path() const { return {}; }
 };
 
 /// How a scan splits its work. mcp-cpp owns no threads: the scan tools

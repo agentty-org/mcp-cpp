@@ -1,0 +1,18 @@
+{
+  "name": "demo",
+  "version": "1.2.3",
+  "scripts": {"build": "tsc", "test": "vitest", "lint": "eslint ."},
+  "dependencies": {"react": "^18.2.0", "zod": "3.22.4", "lodash": "^4.17.21"},
+  "services": [
+    {"name": "api", "port": 8080, "kind": "web", "ok": true, "n": 3, "tags": ["a", "b"]},
+    {"name": "db", "port": 5432, "kind": "data", "ok": false, "n": 1, "tags": []},
+    {"name": "cache", "kind": "data", "ok": true, "n": 5, "tags": ["b"]},
+    {"name": "edge", "port": 443, "kind": "web", "ok": true, "n": 2, "tags": ["c", "a"]}
+  ],
+  "nested": {"a": {"port": 1, "b": {"port": 2, "c": [{"port": 3}, {"x": null}]}}},
+  "nums": [3, 1.5, -2, 10, 0, 7],
+  "text": "Hello, Wörld! foo-bar_baz 42",
+  "mixed": [null, true, false, 1, "s", [1], {"k": 1}],
+  "empty": {},
+  "csvrow": ["a", "b,c", "d\"e", 1, null, true]
+}

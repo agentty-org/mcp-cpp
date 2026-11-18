@@ -79,7 +79,19 @@ def check(resp, expect):
     """Return (ok, reason)."""
     is_err = bool(resp.get("error")) or bool(resp.get("result", {}).get("isError"))
     if expect.get("is_error"):
-        return (is_err, "expected an error, got success" if not is_err else "")
+        if not is_err:
+            return (False, "expected an error, got success")
+        # An error's TEXT is part of the contract too: a refusal that doesn't
+        # name the cause is a worse tool. Check it like any other output.
+        etext = "".join(c.get("text", "") for c in resp.get("result", {}).get("content", [])) \
+            or json.dumps(resp.get("error", ""))
+        for sub in expect.get("contains", []):
+            if sub not in etext:
+                return (False, f"error text missing {sub!r}")
+        for sub in expect.get("not_contains", []):
+            if sub in etext:
+                return (False, f"unexpected {sub!r} in error text")
+        return (True, "")
     if is_err:
         return (False, f"unexpected error: {json.dumps(resp)[:200]}")
     text = response_text(resp) or ""

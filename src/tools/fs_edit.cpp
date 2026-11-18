@@ -385,8 +385,47 @@ std::string render_did_you_mean(std::string_view buf, std::string_view needle,
 
 constexpr int kIdempotentNoOp = -1;
 
+// How an edit landed. `pos`/`len` name the matched region in the buffer the
+// edit was applied to (npos when not tracked, e.g. regex / replace_all).
+struct MatchInfo {
+    std::string strategy = "exact";
+    bool        exact = true;
+    double      ratio = 1.0;
+    std::size_t pos = std::string::npos;
+    std::size_t len = 0;
+};
+
+std::vector<std::string_view> ws_tokens(std::string_view s) {
+    std::vector<std::string_view> out;
+    std::size_t i = 0;
+    auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+    while (i < s.size()) {
+        while (i < s.size() && ws(s[i])) ++i;
+        std::size_t b = i;
+        while (i < s.size() && !ws(s[i])) ++i;
+        if (i > b) out.push_back(s.substr(b, i - b));
+    }
+    return out;
+}
+
+// Classify a successful fuzzy_find hit.
+void classify_fuzzy(MatchInfo& mi, std::string_view buf, std::string_view needle,
+                    const util::FuzzyMatch& fm) {
+    mi.pos = fm.pos; mi.len = fm.len;
+    if (buf.substr(fm.pos, fm.len) == needle) {
+        mi.strategy = "exact"; mi.exact = true; mi.ratio = 1.0;
+    } else if (fm.strategy == 1) {
+        mi.strategy = "indent-relative"; mi.exact = false; mi.ratio = 1.0;
+    } else {
+        mi.exact = false;
+        mi.ratio = fm.ratio;
+        mi.strategy = std::format("fuzzy {}%", static_cast<int>(fm.ratio * 100 + 0.5));
+    }
+}
+
 int apply_one(std::string& buf, const OneEdit& e,
-              const std::string& path_str, std::string& err) {
+              const std::string& path_str, std::string& err, MatchInfo& mi) {
+    mi = MatchInfo{};
     // ── regex mode: sed s/pattern/replacement/[g] without the bash trip ──
     // old_text is an ECMAScript regex matched against the WHOLE buffer
     // (multiline: ^ $ anchor per line), new_text may use $1-$9 / $& backrefs.
@@ -580,8 +619,11 @@ int apply_one(std::string& buf, const OneEdit& e,
                 if (n > 0) return n;
             }
         }
+        // replace_all / expected_replacements never fuzzy-match: only an
+        // exact-modulo-indentation hit (DP cost 0) is accepted.
         auto fm = util::fuzzy_find(buf, e.old_text, e.new_text, e.line_hint);
-        if (fm.ok) {
+        if (fm.ok && fm.strategy == 1) {
+            classify_fuzzy(mi, buf, e.old_text, fm);
             std::string_view repl = fm.adjusted_new_text.empty()
                 ? std::string_view{e.new_text}
                 : std::string_view{fm.adjusted_new_text};
@@ -591,8 +633,9 @@ int apply_one(std::string& buf, const OneEdit& e,
         if (int ln = closest_line_hint(buf, e.old_text); ln > 0) {
             auto window = render_context_window(buf, ln, 2);
             err = std::format(
-                "old_text not found in {} (replace_all tried exact, CRLF, "
-                "and fuzzy strategies). The closest matching line is around "
+                "old_text not found in {} (replace_all / expected_replacements "
+                "accept only exact, CRLF and indentation-relative matches — "
+                "never fuzzy). The closest matching line is around "
                 "line {} — here are the actual bytes at that location:\n"
                 "```\n{}```\n"
                 "Copy the snippet byte-for-byte from above and retry.",
@@ -600,7 +643,8 @@ int apply_one(std::string& buf, const OneEdit& e,
         }
         else
             err = "old_text not found in " + path_str
-                + " (replace_all tried exact, CRLF, and fuzzy strategies). "
+                + " (replace_all / expected_replacements accept only exact, "
+                  "CRLF and indentation-relative matches — never fuzzy). "
                   "Re-read the file and copy the snippet byte-for-byte.";
         return 0;
     }
@@ -629,6 +673,17 @@ int apply_one(std::string& buf, const OneEdit& e,
     }
 
     auto m = util::fuzzy_find(buf, e.old_text, e.new_text, e.line_hint);
+    const bool counted = e.expected_replacements > 0;
+    if (m.ok && counted && m.strategy != 1) {
+        int ln = line_of_offset(buf, m.pos);
+        err = std::format(
+            "old_text has no exact match in {}; the closest candidate (fuzzy "
+            "{}%) is at line {}, but expected_replacements never applies a "
+            "fuzzy match.\n\n{}\n\nCopy old_text byte-for-byte and retry.",
+            path_str, static_cast<int>(m.ratio * 100 + 0.5), ln,
+            render_context_window(buf, ln));
+        return 0;
+    }
     if (!m.ok) {
         if (m.far_from_hint_line) {
             // We DID find something; we declined to trust it. Saying "no
@@ -703,7 +758,15 @@ int apply_one(std::string& buf, const OneEdit& e,
                         if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
                             ++got;
                     }
-                    if (got == need && byte_end > byte_pos) {
+                    // Squashing ALL whitespace would let `foo bar` match
+                    // `foobar`: require identical whitespace-split tokens.
+                    if (got == need && byte_end > byte_pos && !counted
+                        && ws_tokens(std::string_view(buf).substr(
+                               byte_pos, byte_end - byte_pos))
+                           == ws_tokens(e.old_text)) {
+                        mi.strategy = "whitespace-normalised";
+                        mi.exact = false;
+                        mi.pos = byte_pos; mi.len = byte_end - byte_pos;
                         buf = minimal_splice(buf, byte_pos,
                                              byte_end - byte_pos, e.new_text);
                         return 1;
@@ -737,9 +800,20 @@ int apply_one(std::string& buf, const OneEdit& e,
         m.adjusted_new_text.empty()
             ? std::string_view{e.new_text}
             : std::string_view{m.adjusted_new_text};
+    classify_fuzzy(mi, buf, e.old_text, m);
     buf = minimal_splice(buf, m.pos, m.len, repl);
     return 1;
 }
+
+// Dominant line ending: CRLF only when \r\n outnumbers bare \n.
+bool dominant_crlf(std::string_view s) noexcept {
+    std::size_t crlf = 0, lf = 0;
+    for (std::size_t i = 0; i < s.size(); ++i)
+        if (s[i] == '\n') { if (i > 0 && s[i - 1] == '\r') ++crlf; else ++lf; }
+    return crlf > lf;
+}
+
+constexpr std::string_view kBom = "\xEF\xBB\xBF";
 
 // True when every line of `s` starts with read's `cat -n` prefix (spaces,
 // digits, one tab); strips the prefixes in place. Anything else is left alone.
@@ -811,7 +885,8 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
               "`write` to rewrite it whole."));
 
     std::string staleness_warning;
-    if (staleness(call, p) == util::StaleVerdict::Stale) {
+    const bool is_stale = staleness(call, p) == util::StaleVerdict::Stale;
+    if (is_stale) {
         staleness_warning =
             "\xe2\x9a\xa0  The file has changed on disk since the last time a tool "
             "observed it this session. The edit was applied to the CURRENT "
@@ -836,6 +911,13 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
         return std::unexpected(ToolError::binary(
             "refusing to edit binary file: " + a.path->string()
             + " (the bounded read contains NUL bytes)."));
+    // A leading UTF-8 BOM is not part of any old_text: strip it before
+    // matching and restore it on write.
+    std::string bom;
+    if (std::string_view(original).starts_with(kBom)) {
+        bom = std::string(kBom);
+        original.erase(0, kBom.size());
+    }
     std::string updated  = original;
 
     struct EditOutcome {
@@ -843,7 +925,13 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
         int  applied;
         bool exact_count_mismatch;
         std::string err;
+        std::string strategy = {};
+        bool exact = true;
+        int  line_lo = 0, line_hi = 0;
     };
+    // Byte ranges (in `updated`) written by earlier edits of this call.
+    std::vector<std::pair<std::size_t, std::size_t>> written;
+    bool any_inexact = false;
     std::vector<EditOutcome> outcomes;
     outcomes.reserve(a.edits.size());
     std::size_t skipped_noop = 0;
@@ -851,10 +939,7 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
     std::size_t idempotent = 0;
     // A CRLF file keeps CRLF: the model writes \n, so give its text the file's
     // endings before matching. Otherwise an exact hit spliced bare \n lines in.
-    const bool file_crlf = [&] {
-        const auto nl = original.find('\n');
-        return nl != std::string::npos && nl > 0 && original[nl - 1] == '\r';
-    }();
+    const bool file_crlf = dominant_crlf(original);
     const auto to_crlf = [](std::string_view s) {
         std::string out;
         out.reserve(s.size() + s.size() / 40);
@@ -881,7 +966,8 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
         // apply_one rewrites `updated` in place; keep the bytes from before
         // so an edit that fails its count can be undone exactly.
         std::string before_this = updated;
-        int n = apply_one(updated, ed, a.path->string(), err);
+        MatchInfo mi;
+        int n = apply_one(updated, ed, a.path->string(), err, mi);
         // old_text copied straight out of a read keeps its "   12\t" prefixes.
         // Strip them from both sides and try once more.
         if (n == 0 && !ed.regex) {
@@ -890,7 +976,7 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
                 (void)strip_read_line_numbers(bare.new_text);
                 std::string retry_err;
                 updated = before_this;
-                const int m = apply_one(updated, bare, a.path->string(), retry_err);
+                const int m = apply_one(updated, bare, a.path->string(), retry_err, mi);
                 if (m != 0) n = m;
                 else updated = before_this;
             }
@@ -928,9 +1014,56 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
             outcomes.push_back({i, 0, false, std::move(err)});
             continue;
         }
-        outcomes.push_back({i, n, false, {}});
+        // Changed byte range of this edit, in the post-edit buffer.
+        std::size_t pre = 0;
+        while (pre < before_this.size() && pre < updated.size()
+               && before_this[pre] == updated[pre]) ++pre;
+        std::size_t suf = 0;
+        while (suf < before_this.size() - pre && suf < updated.size() - pre
+               && before_this[before_this.size() - 1 - suf]
+                  == updated[updated.size() - 1 - suf]) ++suf;
+        const std::size_t old_end = before_this.size() - suf;
+        const std::size_t new_end = updated.size() - suf;
+        if (!mi.exact && mi.pos != std::string::npos) {
+            const std::size_t lo = mi.pos, hi = mi.pos + mi.len;
+            bool overlap = false;
+            for (auto [wlo, whi] : written)
+                if (lo < std::max(whi, wlo + 1) && wlo < std::max(hi, lo + 1)) { overlap = true; break; }
+            if (overlap) {
+                updated = std::move(before_this);
+                outcomes.push_back({i, 0, false, std::format(
+                    "edit {} only matched non-exactly ({}) and that region "
+                    "overlaps text written by an earlier edit in this call; "
+                    "refusing to guess. Merge the overlapping edits into one, "
+                    "or give an exact old_text.", i, mi.strategy)});
+                continue;
+            }
+        }
+        const std::ptrdiff_t delta = static_cast<std::ptrdiff_t>(new_end)
+                                   - static_cast<std::ptrdiff_t>(old_end);
+        for (auto& [wlo, whi] : written)
+            if (wlo >= old_end) { wlo += delta; whi += delta; }
+        written.emplace_back(pre, new_end);
+        EditOutcome oc{i, n, false, {}};
+        oc.strategy = mi.strategy;
+        oc.exact = mi.exact;
+        if (!mi.exact) any_inexact = true;
+        if (mi.pos != std::string::npos) {
+            oc.line_lo = line_of_offset(before_this, mi.pos);
+            oc.line_hi = line_of_offset(before_this, mi.pos + (mi.len ? mi.len - 1 : 0));
+        } else {
+            oc.line_lo = line_of_offset(updated, pre);
+            oc.line_hi = line_of_offset(updated, new_end > pre ? new_end - 1 : pre);
+        }
+        outcomes.push_back(std::move(oc));
         ++applied;
     }
+
+    if (is_stale && any_inexact)
+        return std::unexpected(ToolError::invalid_args(
+            "the file changed on disk since you last read it; re-read it "
+            "before editing (exact, unique matches are still allowed). "
+            "Nothing was written."));
 
     std::size_t failed = 0;
     for (const auto& o : outcomes) if (o.applied == 0) ++failed;
@@ -984,15 +1117,15 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
               "there.", std::nullopt};
 
     auto d = diff::compute(a.path->string(), original, updated);
-    if (auto werr = util::write_file(*a.path, updated); !werr.empty())
+    if (auto werr = util::write_file(*a.path, bom + updated); !werr.empty())
         return std::unexpected(ToolError::io(werr));
     {
         std::error_code mt_ec;
         auto new_mtime = call.fs().stat(p).mtime;
         if (!mt_ec) {
             record_seen(call, p, new_mtime,
-                                   static_cast<std::uintmax_t>(updated.size()),
-                                   util::cheap_content_hash(updated));
+                                   static_cast<std::uintmax_t>(bom.size() + updated.size()),
+                                   util::cheap_content_hash(bom + updated));
         }
     }
 
@@ -1046,6 +1179,24 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
     if (unified.empty() || unified.back() != '\n') msg << "\n";
     msg << "```";
 
+    {
+        std::string warn, info;
+        for (const auto& o : outcomes) {
+            if (o.applied <= 0 || o.strategy.empty()) continue;
+            info += std::format("\n  edits[{}]: {} at L{}-L{}", o.index,
+                                o.strategy, o.line_lo, o.line_hi);
+            if (!o.exact)
+                warn += std::format("\n\u26a0 edit {} matched {} at L{}-L{} \u2014 "
+                                    "verify the diff", o.index,
+                                    o.strategy.starts_with("fuzzy")
+                                        ? std::format("fuzzily ({})", o.strategy.substr(6))
+                                        : o.strategy,
+                                    o.line_lo, o.line_hi);
+        }
+        if (!info.empty()) msg << "\n\nMatch:" << info;
+        if (!warn.empty()) msg << "\n" << warn;
+    }
+
     if (a.edits.size() > 1 && (failed > 0 || idempotent > 0)) {
         msg << "\n\nPer-edit results:";
         for (const auto& o : outcomes) {
@@ -1065,7 +1216,7 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
     }
 
     // Carry the FileChange (before/after + counts) to the host diff-review UI.
-    FileChange change = make_change(a.path->string(), original, updated);
+    FileChange change = make_change(a.path->string(), bom + original, bom + updated);
     return ToolOutput{msg.str(), std::move(change)};
 }
 
@@ -1185,6 +1336,8 @@ struct Hunk {
     std::string after;    // context + added lines (the replacement)
     long        old_start = 0;  // from @@ -old_start,.. (1-based line hint)
     int         index = 0;      // 1-based hunk number for diagnostics
+    bool        old_no_eol = false;  // "\ No newline" after a -/space line
+    bool        new_no_eol = false;  // "\ No newline" after a +/space line
 };
 
 struct ApplyPatchArgs {
@@ -1192,6 +1345,7 @@ struct ApplyPatchArgs {
     std::string         display_description;
     std::string         patch;
     std::optional<util::WorkspacePath> path;
+    util::Bounds        bounds{};      // multi-file mode: resolve per-op paths
 };
 
 // A unified-diff body line: strip the leading marker, keep the text. Handles
@@ -1219,7 +1373,15 @@ struct ApplyPatchArgs {
         for (++i; i < lines.size(); ++i) {
             const std::string& b = lines[i];
             if (b.rfind("@@", 0) == 0) { --i; break; }
-            if (b.rfind("\\ No newline", 0) == 0) continue;   // sentinel
+            if (b.rfind("\\ No newline", 0) == 0) {   // sentinel
+                const std::string& prev = lines[i - 1];
+                const char pm = prev.empty() ? ' ' : prev[0];
+                auto chop = [](std::string& s) {
+                    if (!s.empty() && s.back() == '\n') s.pop_back(); };
+                if (pm == '-' || pm == ' ') { chop(h.before); h.old_no_eol = true; }
+                if (pm == '+' || pm == ' ') { chop(h.after);  h.new_no_eol = true; }
+                continue;
+            }
             if (b.empty()) { h.before += "\n"; h.after += "\n"; continue; }
             char mk = b[0];
             std::string body = b.substr(1);
@@ -1246,70 +1408,36 @@ struct ApplyPatchArgs {
     return hunks;
 }
 
-ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
-    const auto& p = a.path->path();
-    std::error_code ec;
-    if (!call.fs().stat(p).exists)
-        return std::unexpected(ToolError::not_found(
-            "file not found: " + a.path->string()
-            + ". apply_patch modifies an existing file; use `write` to create "
-              "a new one."));
-    if (!call.fs().stat(p).regular)
-        return std::unexpected(ToolError::not_a_file(
-            "not a regular file: " + a.path->string()));
-    constexpr std::uintmax_t kMaxBytes = 1024u * 1024u;
-    const std::uintmax_t size = call.fs().stat(p).size;
-    if (!ec && size > kMaxBytes)
-        return std::unexpected(ToolError::too_large(std::format(
-            "file is {} KiB (> 1 MiB apply_patch cap).", size / 1024)));
-    if (util::is_binary_file(call.fs(), p))
-        return std::unexpected(ToolError::binary(
-            "refusing to patch binary file: " + a.path->string()));
+struct HunkMatch { int index; std::string strategy; bool exact; int lo, hi; };
+struct HunksApplied { std::string updated; std::vector<HunkMatch> matches; };
 
-    std::string err;
-    auto hunks = parse_hunks(a.patch, err);
-    if (hunks.empty())
-        return std::unexpected(ToolError::invalid_args(std::move(err)));
-    // Each hunk runs a full fuzzy_find over the (≤ 1 MiB) file. That per-hunk
-    // cost is bounded (Myers + the DP-cell cap), but the hunk COUNT was not —
-    // so a patch with thousands of hunks multiplied a bounded ~10 ms search
-    // into a minutes-long apply from one tool call. A real patch to a file this
-    // size has at most a few dozen hunks; cap well above that and reject the
-    // pathological/adversarial rest.
-    constexpr std::size_t kMaxHunks = 256;
-    if (hunks.size() > kMaxHunks)
-        return std::unexpected(ToolError::invalid_args(std::format(
-            "patch has {} hunks (> {} cap) — that's far more than a real edit to "
-            "a file this size. Split it into smaller patches, or use `edit` for "
-            "targeted changes.", hunks.size(), kMaxHunks)));
+const char* const kStaleInexact =
+    "the file changed on disk since you last read it; re-read it "
+    "before editing (exact, unique matches are still allowed). "
+    "Nothing was written.";
 
-    std::string original;
-    try { original = util::read_file(*a.path); }
-    catch (...) { return std::unexpected(ToolError::io(
-        "cannot read " + a.path->string())); }
-    if (original.find('\0') != std::string::npos)
-        return std::unexpected(ToolError::binary(
-            "refusing to patch binary file: " + a.path->string()));
+// Apply parsed hunks to `file` (raw bytes, BOM/CRLF/EOF handled here).
+// Pure: no IO. `disp` names the file in diagnostics.
+std::expected<HunksApplied, ToolError>
+apply_hunks(std::string file, std::vector<Hunk> hunks, std::string_view disp,
+            bool stale) {
+    std::string bom;
+    if (std::string_view(file).starts_with(kBom)) {
+        bom = std::string(kBom); file.erase(0, kBom.size());
+    }
+    bool markers = false;
+    for (const auto& h : hunks) markers |= h.old_no_eol || h.new_no_eol;
+    // No markers: keep the file's trailing-newline state. Pad a missing final
+    // newline so \n-terminated hunk lines match, and strip it afterwards.
+    const bool pad = !markers && !file.empty() && file.back() != '\n';
+    const bool file_crlf = dominant_crlf(file);
+    if (pad) file += file_crlf ? "\r\n" : "\n";
+    const std::string& original = file;
 
-    std::string stale_note;
-    if (staleness(call, p) == util::StaleVerdict::Stale)
-        stale_note =
-            "\xe2\x9a\xa0  The file changed on disk since a tool last observed "
-            "it this session. The patch was applied to the CURRENT bytes; "
-            "re-read if the result looks wrong.\n\n";
-
-    // Locate every hunk against the ORIGINAL buffer (so hunk N's search isn't
-    // perturbed by hunk N-1's splice), collect spans, then splice bottom-up.
     struct Span { std::size_t pos, len; std::string replacement; int hunk; };
     std::vector<Span> spans;
+    std::vector<HunkMatch> matches;
     spans.reserve(hunks.size());
-    // A CRLF file keeps CRLF: the patch's lines are \n-terminated, so give the
-    // hunks the file's endings before matching. Otherwise the fuzzy match
-    // still lands but splices bare \n lines into a \r\n file.
-    const bool file_crlf = [&] {
-        const auto nl = original.find('\n');
-        return nl != std::string::npos && nl > 0 && original[nl - 1] == '\r';
-    }();
     if (file_crlf) {
         const auto to_crlf = [](const std::string& s) {
             std::string out;
@@ -1322,6 +1450,7 @@ ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
         };
         for (auto& h : hunks) { h.before = to_crlf(h.before); h.after = to_crlf(h.after); }
     }
+    bool any_inexact = false;
     for (const auto& h : hunks) {
         // A pure-insertion hunk (no `before`) has nothing to fuzzy-match;
         // reject rather than guess a location.
@@ -1348,17 +1477,30 @@ ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
                     "the diff; if line {} really is the target, say so with an "
                     "accurate @@ header.",
                     h.index, h.old_start, fm.far_from_hint_line,
-                    a.path->string(), fm.far_from_hint_line)));
+                    disp, fm.far_from_hint_line)));
             return std::unexpected(ToolError::no_match(std::format(
                 "hunk #{} did not match the file (context/removed lines not "
                 "found, even fuzzily). The file may have moved on from the "
                 "patch's base \u2014 re-read {} and regenerate the diff.",
-                h.index, a.path->string())));
+                h.index, disp)));
         }
+        if (h.old_no_eol && (fm.pos + fm.len != original.size()
+                             || original.ends_with('\n')))
+            return std::unexpected(ToolError::no_match(std::format(
+                "hunk #{} says the old side has no newline at end of file, but "
+                "it did not match at a newline-less EOF of {}.", h.index, disp)));
+        MatchInfo mi;
+        classify_fuzzy(mi, original, h.before, fm);
+        any_inexact |= !mi.exact;
+        matches.push_back({h.index, mi.strategy, mi.exact,
+                           line_of_offset(original, fm.pos),
+                           line_of_offset(original, fm.pos + (fm.len ? fm.len - 1 : 0))});
         std::string repl = fm.adjusted_new_text.empty() ? h.after
                                                          : fm.adjusted_new_text;
         spans.push_back({fm.pos, fm.len, std::move(repl), h.index});
     }
+    if (stale && any_inexact)
+        return std::unexpected(ToolError::invalid_args(kStaleInexact));
 
     // Reject overlapping hunks (two hunks that located to the same region).
     std::sort(spans.begin(), spans.end(),
@@ -1374,6 +1516,97 @@ ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
     std::string updated = original;
     for (auto it = spans.rbegin(); it != spans.rend(); ++it)
         updated.replace(it->pos, it->len, it->replacement);
+    if (pad) {
+        if (updated.ends_with("\r\n") && file_crlf) updated.resize(updated.size() - 2);
+        else if (updated.ends_with('\n')) updated.pop_back();
+    }
+    return HunksApplied{bom + updated, std::move(matches)};
+}
+
+// Validate + read an existing file for patching (same checks for single- and
+// multi-file mode).
+std::expected<std::string, ToolError>
+load_for_patch(const Call& call, const util::WorkspacePath& wp) {
+    const auto& p = wp.path();
+    const auto st = call.fs().stat(p);
+    if (!st.exists)
+        return std::unexpected(ToolError::not_found(
+            "file not found: " + wp.string()
+            + ". apply_patch modifies an existing file; use `write` to create "
+              "a new one."));
+    if (!st.regular)
+        return std::unexpected(ToolError::not_a_file(
+            "not a regular file: " + wp.string()));
+    constexpr std::uintmax_t kMaxBytes = 1024u * 1024u;
+    if (st.size > kMaxBytes)
+        return std::unexpected(ToolError::too_large(std::format(
+            "file is {} KiB (> 1 MiB apply_patch cap).", st.size / 1024)));
+    if (util::is_binary_file(call.fs(), p))
+        return std::unexpected(ToolError::binary(
+            "refusing to patch binary file: " + wp.string()));
+    std::string original;
+    try { original = util::read_file(call.fs(), p); }
+    catch (...) { return std::unexpected(ToolError::io(
+        "cannot read " + wp.string())); }
+    if (original.find('\0') != std::string::npos)
+        return std::unexpected(ToolError::binary(
+            "refusing to patch binary file: " + wp.string()));
+    return original;
+}
+
+std::expected<std::vector<Hunk>, ToolError> parse_hunks_checked(std::string_view patch) {
+    std::string err;
+    auto hunks = parse_hunks(std::string(patch), err);
+    if (hunks.empty())
+        return std::unexpected(ToolError::invalid_args(std::move(err)));
+    // Cap the hunk count: each runs a bounded fuzzy_find, but thousands of
+    // hunks multiply that into a minutes-long apply.
+    constexpr std::size_t kMaxHunks = 256;
+    if (hunks.size() > kMaxHunks)
+        return std::unexpected(ToolError::invalid_args(std::format(
+            "patch has {} hunks (> {} cap) — that's far more than a real edit to "
+            "a file this size. Split it into smaller patches, or use `edit` for "
+            "targeted changes.", hunks.size(), kMaxHunks)));
+    return hunks;
+}
+
+std::string render_matches(const std::vector<HunkMatch>& ms) {
+    std::string info, warn;
+    for (const auto& m : ms) {
+        info += std::format("\n  hunk #{}: {} (lines {}-{})", m.index, m.strategy,
+                            m.lo, m.hi);
+        if (!m.exact)
+            warn += std::format("\n\xe2\x9a\xa0  hunk #{} matched {} at lines {}-{} "
+                                "\u2014 verify the diff.", m.index, m.strategy,
+                                m.lo, m.hi);
+    }
+    std::string out = "\n\nMatch:" + info;
+    if (!warn.empty()) out += "\n" + warn;
+    return out;
+}
+
+ExecResult run_apply_patch_multi(const Call& call, const ApplyPatchArgs& a);
+
+ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
+    if (!a.path) return run_apply_patch_multi(call, a);
+    const auto& p = a.path->path();
+    auto orig_r = load_for_patch(call, *a.path);
+    if (!orig_r) return std::unexpected(std::move(orig_r.error()));
+    const std::string original = std::move(*orig_r);
+    auto hunks_r = parse_hunks_checked(a.patch);
+    if (!hunks_r) return std::unexpected(std::move(hunks_r.error()));
+    const auto& hunks = *hunks_r;
+
+    const bool is_stale = staleness(call, p) == util::StaleVerdict::Stale;
+    std::string stale_note;
+    if (is_stale)
+        stale_note =
+            "\xe2\x9a\xa0  The file changed on disk since a tool last observed "
+            "it this session. The patch was applied to the CURRENT bytes; "
+            "re-read if the result looks wrong.\n\n";
+    auto res = apply_hunks(original, hunks, a.path->string(), is_stale);
+    if (!res) return std::unexpected(std::move(res.error()));
+    const std::string updated = std::move(res->updated);
 
     if (updated == original)
         return ToolOutput{stale_note + "Patch produced no change \u2014 the file "
@@ -1424,14 +1657,227 @@ ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
         << d.removed << "-, " << hunks.size() << " hunk"
         << (hunks.size()==1?"":"s") << where << "):\n\n```diff\n" << unified;
     if (unified.empty() || unified.back() != '\n') msg << "\n";
-    msg << "```";
+    msg << "```" << render_matches(res->matches);
 
     FileChange change = make_change(a.path->string(), original, updated);
     return ToolOutput{msg.str(), std::move(change)};
 }
 
+// ---- multi-file envelope --------------------------------------------------
+struct FileOp {
+    enum Kind { Add, Update, Delete } kind = Update;
+    std::string path, move_to;
+    std::string body;   // Add: content; Update: hunk text (@@ ...)
+};
+
+std::vector<std::string> split_lines_keep(std::string_view s) {
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    while (pos < s.size()) {
+        auto eol = s.find('\n', pos);
+        if (eol == std::string_view::npos) eol = s.size();
+        std::string l(s.substr(pos, eol - pos));
+        if (!l.empty() && l.back() == '\r') l.pop_back();
+        out.push_back(std::move(l));
+        pos = eol + 1;
+    }
+    return out;
+}
+
+std::expected<std::vector<FileOp>, ToolError> parse_v4a(std::string_view patch) {
+    std::vector<FileOp> ops;
+    FileOp* cur = nullptr;
+    auto starts = [](const std::string& l, std::string_view p) { return l.rfind(p, 0) == 0; };
+    for (const auto& l : split_lines_keep(patch)) {
+        if (starts(l, "*** Begin Patch") || starts(l, "*** End of File")) continue;
+        if (starts(l, "*** End Patch")) break;
+        if (starts(l, "*** Add File: "))    { ops.push_back({FileOp::Add, l.substr(14), {}, {}}); cur = &ops.back(); continue; }
+        if (starts(l, "*** Update File: ")) { ops.push_back({FileOp::Update, l.substr(17), {}, {}}); cur = &ops.back(); continue; }
+        if (starts(l, "*** Delete File: ")) { ops.push_back({FileOp::Delete, l.substr(17), {}, {}}); cur = nullptr; continue; }
+        if (starts(l, "*** Move to: ")) {
+            if (!cur || cur->kind != FileOp::Update)
+                return std::unexpected(ToolError::invalid_args("`*** Move to:` must follow `*** Update File:`"));
+            cur->move_to = l.substr(13); continue;
+        }
+        if (!cur) { if (l.empty()) continue;
+            return std::unexpected(ToolError::invalid_args("unexpected line outside a file section: " + l)); }
+        if (cur->kind == FileOp::Add) {
+            if (!l.empty() && l[0] != '+')
+                return std::unexpected(ToolError::invalid_args(
+                    "`*** Add File: " + cur->path + "` lines must start with '+'"));
+            cur->body += (l.empty() ? "" : l.substr(1)) + "\n";
+        } else {
+            if (cur->body.empty() && !starts(l, "@@")) cur->body += "@@\n";
+            cur->body += l + "\n";
+        }
+    }
+    if (ops.empty()) return std::unexpected(ToolError::invalid_args("patch envelope has no file sections"));
+    return ops;
+}
+
+std::expected<std::vector<FileOp>, ToolError> parse_unified_multi(std::string_view patch) {
+    std::vector<FileOp> ops;
+    auto lines = split_lines_keep(patch);
+    auto strip = [](std::string p) {
+        if (auto t = p.find('\t'); t != std::string::npos) p.resize(t);
+        if (p.rfind("a/", 0) == 0 || p.rfind("b/", 0) == 0) p.erase(0, 2);
+        return p;
+    };
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (lines[i].rfind("--- ", 0) != 0 || i + 1 >= lines.size()
+            || lines[i + 1].rfind("+++ ", 0) != 0) {
+            if (!ops.empty()) ops.back().body += lines[i] + "\n";
+            continue;
+        }
+        std::string from = strip(lines[i].substr(4)), to = strip(lines[i + 1].substr(4));
+        ++i;
+        FileOp op;
+        if (from == "/dev/null") { op.kind = FileOp::Add; op.path = to; }
+        else if (to == "/dev/null") { op.kind = FileOp::Delete; op.path = from; }
+        else { op.path = from; if (to != from) op.move_to = to; }
+        ops.push_back(std::move(op));
+    }
+    if (ops.empty()) return std::unexpected(ToolError::invalid_args("no `---`/`+++` file headers found"));
+    for (auto& op : ops) {
+        if (op.kind != FileOp::Add) continue;
+        std::string content; bool no_eol = false;
+        for (const auto& l : split_lines_keep(op.body)) {
+            if (l.rfind("\\ No newline", 0) == 0) { no_eol = true; continue; }
+            if (!l.empty() && l[0] == '+') content += l.substr(1) + "\n";
+        }
+        if (no_eol && !content.empty()) content.pop_back();
+        op.body = std::move(content);
+    }
+    return ops;
+}
+
+ExecResult run_apply_patch_multi(const Call& call, const ApplyPatchArgs& a) {
+    const bool v4a = a.patch.find("*** Begin Patch") != std::string::npos;
+    auto ops_r = v4a ? parse_v4a(a.patch) : parse_unified_multi(a.patch);
+    if (!ops_r) return std::unexpected(std::move(ops_r.error()));
+    auto fail = [](const std::string& path, const ToolError& e) {
+        ToolError out = e;
+        out.detail = std::format("{}: {} Nothing was written.", path, e.detail);
+        return std::unexpected(std::move(out));
+    };
+    struct Planned {
+        FileOp op;
+        util::WorkspacePath src, dst;
+        bool existed = false;
+        std::string original, updated;
+        std::vector<HunkMatch> matches;
+    };
+    std::vector<Planned> plan;
+    for (auto& op : *ops_r) {
+        auto src = util::make_workspace_path_checked(op.path, "apply_patch", a.bounds);
+        if (!src) return fail(op.path, src.error());
+        Planned pl{op, *src, *src};
+        if (!op.move_to.empty()) {
+            auto dst = util::make_workspace_path_checked(op.move_to, "apply_patch", a.bounds);
+            if (!dst) return fail(op.move_to, dst.error());
+            pl.dst = *dst;
+        }
+        if (op.kind == FileOp::Add) {
+            if (call.fs().stat(src->path()).exists)
+                return fail(op.path, ToolError::invalid_args("file already exists; use Update."));
+            pl.updated = op.body;
+        } else {
+            auto orig = load_for_patch(call, *src);
+            if (!orig) return fail(op.path, orig.error());
+            pl.existed = true;
+            pl.original = *orig;
+            if (op.kind == FileOp::Update && op.body.find("\n-") == std::string::npos
+                && op.body.find("\n+") == std::string::npos) {
+                pl.updated = pl.original;      // pure move
+            } else if (op.kind == FileOp::Update) {
+                auto hunks = parse_hunks_checked(op.body);
+                if (!hunks) return fail(op.path, hunks.error());
+                const bool stale = staleness(call, src->path()) == util::StaleVerdict::Stale;
+                auto res = apply_hunks(pl.original, *hunks, op.path, stale);
+                if (!res) return fail(op.path, res.error());
+                pl.updated = std::move(res->updated);
+                pl.matches = std::move(res->matches);
+            }
+        }
+        plan.push_back(std::move(pl));
+    }
+
+    // Commit phase. Track what was done so a failure can roll back.
+    std::vector<std::size_t> done;
+    auto rollback = [&] {
+        for (auto it = done.rbegin(); it != done.rend(); ++it) {
+            const auto& pl = plan[*it];
+            std::error_code ec;
+            if (pl.op.kind == FileOp::Add) { call.fs().remove(pl.src.path(), ec); continue; }
+            (void)util::write_file(pl.src, pl.original);
+            if (pl.dst.path() != pl.src.path()) call.fs().remove(pl.dst.path(), ec);
+        }
+    };
+    for (std::size_t i = 0; i < plan.size(); ++i) {
+        auto& pl = plan[i];
+        std::string werr;
+        if (pl.op.kind == FileOp::Delete) {
+            std::error_code ec;
+            call.fs().remove(pl.src.path(), ec);
+            if (ec) werr = ec.message();
+        } else {
+            werr = util::write_file(pl.dst, pl.updated);
+            if (werr.empty() && pl.dst.path() != pl.src.path()) {
+                std::error_code ec;
+                call.fs().remove(pl.src.path(), ec);
+                if (ec) { werr = ec.message(); done.push_back(i); }
+            }
+        }
+        if (!werr.empty()) {
+            rollback();
+            return std::unexpected(ToolError::io(std::format(
+                "writing {} failed: {}; earlier files were restored.", pl.op.path, werr)));
+        }
+        done.push_back(i);
+        if (pl.op.kind != FileOp::Delete) {
+            const auto& q = pl.dst.path();
+            record_seen(call, q, call.fs().stat(q).mtime,
+                        static_cast<std::uintmax_t>(pl.updated.size()),
+                        util::cheap_content_hash(pl.updated));
+        }
+    }
+
+    std::ostringstream sum, diffs;
+    for (const auto& pl : plan) {
+        const std::string shown = pl.dst.string();
+        auto d = diff::compute(shown, pl.original, pl.updated);
+        const char* verb = pl.op.kind == FileOp::Add ? "Added"
+                         : pl.op.kind == FileOp::Delete ? "Deleted"
+                         : pl.dst.path() != pl.src.path() ? "Moved" : "Updated";
+        sum << verb << " " << pl.src.string();
+        if (pl.dst.path() != pl.src.path()) sum << " -> " << shown;
+        sum << " (+" << d.added << " -" << d.removed << ")\n";
+        std::string u = diff::render_unified(d);
+        if (!u.empty()) {
+            diffs << "\n```diff\n" << u;
+            if (u.back() != '\n') diffs << "\n";
+            diffs << "```";
+        }
+        if (!pl.matches.empty()) diffs << render_matches(pl.matches);
+    }
+    return ToolOutput{std::format("Applied patch to {} file{}:\n{}{}", plan.size(),
+                                  plan.size() == 1 ? "" : "s", sum.str(), diffs.str()),
+                      std::nullopt};
+}
+
 std::expected<ApplyPatchArgs, ToolError> check_apply_patch_args(ApplyPatchArgs a,
                                                                 const util::Bounds& b) {
+    if (a.raw_path.empty()) {
+        const bool v4a = a.patch.find("*** Begin Patch") != std::string::npos;
+        const bool uni = a.patch.find("+++ ") != std::string::npos
+                      && a.patch.find("--- ") != std::string::npos;
+        if (!v4a && !uni)
+            return std::unexpected(ToolError::invalid_args(
+                "`path` is required unless the patch carries file headers "
+                "(`*** Begin Patch` envelope or `--- a/x` / `+++ b/x`)."));
+        a.bounds = b;
+        return a;
+    }
     auto wp = util::make_workspace_path_checked(a.raw_path, "apply_patch", b);
     if (!wp) return std::unexpected(std::move(wp.error()));
     a.path = std::move(*wp);
@@ -1441,8 +1887,7 @@ std::expected<ApplyPatchArgs, ToolError> check_apply_patch_args(ApplyPatchArgs a
 const util::ArgSpec<ApplyPatchArgs>& kApplyPatchArgs() {
     static const util::ArgSpec<ApplyPatchArgs> spec = [] {
         util::ArgSpec<ApplyPatchArgs> s{
-            util::arg(&ApplyPatchArgs::raw_path, "path", "Existing file to patch. Stream FIRST.")
-                .required("`path` is required"),
+            util::arg(&ApplyPatchArgs::raw_path, "path", "File to patch. Stream FIRST. Omit only for a multi-file patch (`*** Begin Patch` envelope or `---`/`+++` headers)."),
             util::arg(&ApplyPatchArgs::display_description, "display_description",
                       "One-line summary shown in the card. Stream second."),
             util::arg(&ApplyPatchArgs::patch, "patch", "A unified diff for THIS file: one or more hunks starting with `@@ -a,b +c,d @@`, body lines prefixed ` ` (context), `-` (remove), `+` (add). File headers (--- / +++) are optional and ignored. Hunks are fuzzy-located (the @@ line numbers are hints), so a patch still applies after the file drifts; every hunk needs \u22651 context line and all hunks apply atomically (any miss \u2192 nothing written).")
@@ -1468,7 +1913,13 @@ void register_edit_tool(Shells& sh) {
         "has drifted from the line numbers in its headers. All hunks apply "
         "atomically: if any can't be placed unambiguously, nothing is "
         "written. Produces a reviewable diff card like `edit`. Use `edit` for "
-        "a one-off substitution, `apply_patch` when you already have a diff.",
+        "a one-off substitution, `apply_patch` when you already have a diff. "
+        "MULTI-FILE: omit `path` and pass either a Codex envelope "
+        "(`*** Begin Patch` / `*** Add File: p` (+lines) / `*** Update File: p` "
+        "[+ `*** Move to: q`] with `@@` hunks / `*** Delete File: p` / "
+        "`*** End Patch`) or a unified diff with `--- a/x` / `+++ b/x` headers "
+        "(/dev/null = add/delete). Every file is computed first; if any fails "
+        "nothing is written.",
         kApplyPatchArgs().schema(),
         EffectSet{Effect::ReadFs, Effect::WriteFs},
         body<ApplyPatchArgs>(run_apply_patch, kApplyPatchArgs(), check_apply_patch_args), 40'000);

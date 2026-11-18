@@ -42,7 +42,8 @@ constexpr double        MATCH_RATIO        = 0.8;   // accepted match
 // while rejecting a needle where half or more is absent — e.g. a bad diff hunk
 // whose sole deletion line doesn't exist ("line four" + one bogus line = 1/2 =
 // 0.5) must stay an honest no-match so patch atomicity holds.
-constexpr double        RELAXED_RATIO_FLOOR = 0.6;
+constexpr double        RELAXED_RATIO_FLOOR = 0.6;   // only with a nearby line hint
+constexpr double        RELAXED_RATIO_FLOOR_NOHINT = 0.85;  // no hint: strict
 constexpr std::uint32_t LINE_HINT_TOLERANCE = 200;  // lines
 // Beyond this many DP cells we bail to "no match" rather than burn the
 // watchdog. This is NOT free per cell: each cell runs fuzzy_eq(), whose inner
@@ -650,7 +651,8 @@ std::vector<Band> candidate_bands(std::string_view file, std::string_view needle
 // Run the DP across every candidate band and union the results.
 std::vector<DPMatch> run_banded_dp(std::string_view file, std::string_view needle,
                                    const std::vector<Line>& fl,
-                                   const std::vector<Line>& nl) {
+                                   const std::vector<Line>& nl,
+                                   bool has_hint) {
     auto bands = candidate_bands(file, needle, fl, nl);
     std::vector<DPMatch> all;
     // Global work budget across ALL bands. candidate_bands can emit many
@@ -709,7 +711,7 @@ std::vector<DPMatch> run_banded_dp(std::string_view file, std::string_view needl
         // two garbage rows would masquerade as an "appears 2 times" match.
         std::vector<DPMatch> relaxed;
         for (const auto& m : keep)
-            if (m.ratio >= RELAXED_RATIO_FLOOR) relaxed.push_back(m);
+            if (m.ratio >= (has_hint ? RELAXED_RATIO_FLOOR : RELAXED_RATIO_FLOOR_NOHINT)) relaxed.push_back(m);
         if (relaxed.size() == 1)
             return relaxed;    // unique, real content: accept the location
         if (relaxed.size() >= 2)
@@ -760,7 +762,9 @@ FuzzyMatch fuzzy_find(std::string_view file,
         int n = count_occurrences(file, needle);
         if (n == 1) {
             auto pos = file.find(needle);
-            return {true, pos, needle.size(), 1, {}, 1};
+            FuzzyMatch ex{true, pos, needle.size(), 1, {}, 1};
+            ex.ratio = 1.0;
+            return ex;
         }
         // n == 0 → keep going (DP may still find a fuzzy hit).
         // n >= 2 → keep going too; line_hint may disambiguate. Below we
@@ -772,7 +776,8 @@ FuzzyMatch fuzzy_find(std::string_view file,
     auto fl = scan_lines(file);
     auto nl = scan_lines(needle);
 
-    auto matches = run_banded_dp(file, needle, fl, nl);
+    auto matches = run_banded_dp(file, needle, fl, nl,
+        line_hint != std::numeric_limits<std::uint32_t>::max());
     if (matches.empty()) {
         // Re-check exact-count for the caller's diagnostic — if exact was
         // ambiguous and DP found nothing better, surface the exact count.
@@ -857,6 +862,7 @@ FuzzyMatch fuzzy_find(std::string_view file,
     out.len = end - pos;
     out.count = 1;
     out.strategy = (pick->cost == 0) ? 1 : 2;
+    out.ratio = pick->cost == 0 ? 1.0 : pick->ratio;
 
     // Indent fix-up. Only when caller actually supplied a replacement.
     if (!new_text.empty()) {

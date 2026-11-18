@@ -27,11 +27,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -94,7 +96,10 @@ struct WebFetchArgs {
     std::string method = "GET";   // "GET" | "HEAD" | "POST"
     std::vector<std::pair<std::string, std::string>> headers;
     std::string display_description;
-    bool allow_jina = true;
+    bool allow_jina = false;      // `render: "jina"`
+    std::string render;           // "" | "none" | "jina"
+    int max_chars  = 64'000;      // extracted text per call
+    int start_char = 0;           // page through long documents
     json raw_headers;
 };
 
@@ -106,6 +111,15 @@ const util::ArgSpec<WebFetchArgs>& kWebFetchArgs() {
         util::arg(&WebFetchArgs::method, "method", "HTTP method (default: GET)"),
         util::arg(&WebFetchArgs::raw_headers, "headers", "Additional headers as key-value pairs")
             .shape(json{{"type", "object"}}),
+        util::arg(&WebFetchArgs::render, "render",
+                  "\"none\" (default) or \"jina\": render a JavaScript-only page through "
+                  "r.jina.ai. Sends the URL to that third party, so it is never automatic "
+                  "and is refused for URLs carrying credentials/tokens."),
+        util::arg(&WebFetchArgs::max_chars, "max_chars",
+                  "Max characters of extracted text to return (default 64000).").range(500, 200'000),
+        util::arg(&WebFetchArgs::start_char, "start_char",
+                  "Start offset into the extracted text, to page through a long document "
+                  "(the footer says where the next page starts).").range(0, 50'000'000),
     };
     return spec;
 }
@@ -115,13 +129,16 @@ std::expected<WebFetchArgs, ToolError> check_web_fetch(WebFetchArgs a, const uti
     if (!a.url.starts_with("https://"))
         return std::unexpected(ToolError::invalid_args(
             "url must start with https:// (web_fetch is TLS-only)"));
+    if (!a.render.empty() && a.render != "none" && a.render != "jina")
+        return std::unexpected(ToolError::invalid_args("render must be \"none\" or \"jina\""));
+    a.allow_jina = a.render == "jina";
     if (a.raw_headers.is_object()) {
         for (auto& [k, v] : a.raw_headers.items()) {
             std::string lower; lower.reserve(k.size());
             for (char c : k) lower.push_back(static_cast<char>(std::tolower((unsigned char)c)));
             std::string val = v.is_string() ? v.get<std::string>() : v.dump();
             if (lower == "x-no-jina") {
-                a.allow_jina = !(val == "1" || val == "true" || val == "yes");
+                if (val == "1" || val == "true" || val == "yes") a.allow_jina = false;
                 continue;
             }
             a.headers.emplace_back(std::move(lower), std::move(val));
@@ -130,8 +147,6 @@ std::expected<WebFetchArgs, ToolError> check_web_fetch(WebFetchArgs a, const uti
     if (a.method == "HEAD" || a.method == "POST" || a.method == "GET") {} else a.method = "GET";
     return a;
 }
-
-constexpr size_t kMaxFetchBytes = 64'000;
 
 struct ParsedUrl {
     std::string host;
@@ -997,7 +1012,124 @@ std::string clip_to_fragment(std::string body, std::string_view fragment) {
     return false;
 }
 
-ExecResult run_web_fetch(HttpClient& client, const WebFetchArgs& a, bool jina) {
+// ── response cache ─────────────────────────────────────────────────────────────
+// Models re-fetch the same doc page several times in one task (read the top,
+// then a #section, then page 2). The session's ToolState keeps the last 32
+// successful GETs (state::fetch_cache): a value the caller owns, aged by
+// count rather than by a clock. Keyed by method + fragment-less URL + render
+// mode; requests carrying credentials never touch it.
+constexpr std::size_t kFetchCacheEntries = 32;
+constexpr std::size_t kFetchCacheMaxBody = 4u * 1024u * 1024u;
+
+std::optional<ToolState::CachedFetch> cache_get(const Call& call, const std::string& key) {
+    return call.with([&](ToolState& s) -> std::optional<ToolState::CachedFetch> {
+        for (auto it = s.fetch_cache.begin(); it != s.fetch_cache.end(); ++it) {
+            if (it->key != key) continue;
+            auto hit = *it;
+            std::rotate(s.fetch_cache.begin(), it, it + 1);   // most recent first
+            return hit;
+        }
+        return std::nullopt;
+    });
+}
+
+void cache_put(const Call& call, ToolState::CachedFetch v) {
+    if (v.body.size() > kFetchCacheMaxBody) return;
+    call.with([&](ToolState& s) {
+        std::erase_if(s.fetch_cache, [&](const auto& e) { return e.key == v.key; });
+        s.fetch_cache.insert(s.fetch_cache.begin(), std::move(v));
+        if (s.fetch_cache.size() > kFetchCacheEntries) s.fetch_cache.resize(kFetchCacheEntries);
+    });
+}
+
+bool has_credential_header(const std::vector<std::pair<std::string, std::string>>& h) {
+    for (const auto& [k, v] : h)
+        if (k == "authorization" || k == "cookie" || k == "proxy-authorization"
+            || k == "x-api-key" || k == "api-key" || k.find("token") != std::string::npos)
+            return true;
+    return false;
+}
+
+// A URL Jina must never see: it carries userinfo, or a query parameter whose
+// NAME looks like a secret (signed S3 URLs, OAuth callbacks, magic links).
+bool url_has_secret(std::string_view url) {
+    auto after_scheme = url.substr(url.find("://") == std::string_view::npos ? 0 : url.find("://") + 3);
+    const auto auth_end = after_scheme.find_first_of("/?#");
+    if (after_scheme.substr(0, auth_end).find('@') != std::string_view::npos) return true;
+    const auto q = url.find('?');
+    if (q == std::string_view::npos) return false;
+    std::string query{url.substr(q + 1, url.find('#', q) - q - 1)};
+    for (char& c : query) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    std::size_t p = 0;
+    while (p <= query.size()) {
+        auto amp = query.find('&', p);
+        const std::string name = query.substr(p, query.find('=', p) < amp ? query.find('=', p) - p : amp - p);
+        for (const char* bad : {"token", "key", "secret", "sig", "auth", "session", "password",
+                                "passwd", "credential", "code", "x-amz-", "jwt", "otp"})
+            if (name.find(bad) != std::string::npos) return true;
+        if (amp == std::string::npos) break;
+        p = amp + 1;
+    }
+    return false;
+}
+
+bool host_is_internal_name(std::string_view host) {
+    std::string h{host};
+    for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return h.find('.') == std::string::npos            // intranet single-label name
+        || h.ends_with(".local") || h.ends_with(".internal") || h.ends_with(".lan")
+        || h.ends_with(".corp") || h.ends_with(".home.arpa") || h.ends_with(".intranet");
+}
+
+// ── charset ────────────────────────────────────────────────────────────────────
+// The charset a page declares: Content-Type first, then <meta charset> /
+// <meta http-equiv content="...; charset=..."> in the first 4 KiB.
+std::string declared_charset(std::string_view content_type, std::string_view body) {
+    auto pick = [](std::string_view s) -> std::string {
+        std::string l{s};
+        for (char& c : l) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        auto p = l.find("charset=");
+        if (p == std::string::npos) return {};
+        p += 8;
+        while (p < l.size() && (l[p] == '"' || l[p] == '\'' || l[p] == ' ')) ++p;
+        auto e = l.find_first_of("\"'; >/\t\r\n", p);
+        return l.substr(p, e == std::string::npos ? std::string::npos : e - p);
+    };
+    if (auto c = pick(content_type); !c.empty()) return c;
+    return pick(body.substr(0, 4096));
+}
+
+// Windows-1252's 0x80-0x9F block (the rest of the byte range is Latin-1).
+constexpr char16_t kCp1252Hi[32] = {
+    0x20AC, 0xFFFD, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0xFFFD, 0x017D, 0xFFFD,
+    0xFFFD, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0xFFFD, 0x017E, 0x0178};
+
+void put_utf8(std::string& o, std::uint32_t cp) {
+    if (cp < 0x80) o += static_cast<char>(cp);
+    else if (cp < 0x800) { o += static_cast<char>(0xC0 | (cp >> 6)); o += static_cast<char>(0x80 | (cp & 0x3F)); }
+    else { o += static_cast<char>(0xE0 | (cp >> 12)); o += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); o += static_cast<char>(0x80 | (cp & 0x3F)); }
+}
+
+// Decode a legacy single-byte page to UTF-8. Anything we don't know is left
+// to to_valid_utf8 (invalid bytes become U+FFFD), never emitted raw.
+std::string decode_charset(std::string body, const std::string& cs) {
+    const bool latin1 = cs == "iso-8859-1" || cs == "latin1" || cs == "latin-1" || cs == "l1"
+                     || cs == "iso8859-1" || cs == "us-ascii" || cs == "ascii";
+    const bool cp1252 = cs == "windows-1252" || cs == "cp1252" || cs == "x-cp1252";
+    if (!latin1 && !cp1252) return body;
+    // A page declared Latin-1 that is valid UTF-8 is (in practice) UTF-8.
+    if (util::is_valid_utf8(body)) return body;
+    std::string out;
+    out.reserve(body.size() + body.size() / 8);
+    for (unsigned char c : body) {
+        if (c < 0x80) out += static_cast<char>(c);
+        else if (c < 0xA0) put_utf8(out, kCp1252Hi[c - 0x80]);   // browsers read latin1 as cp1252 (WHATWG)
+        else put_utf8(out, c);
+    }
+    return out;
+}
+
+ExecResult run_web_fetch(const Call& call, HttpClient& client, const WebFetchArgs& a, bool jina) {
     auto pu = parse_url(a.url);
     if (!pu) return std::unexpected(
         ToolError::invalid_args("could not parse url: " + a.url + " (" + pu.error() + ")"));
@@ -1024,12 +1156,27 @@ ExecResult run_web_fetch(HttpClient& client, const WebFetchArgs& a, bool jina) {
     headers.push_back({"accept-language", "en-US,en;q=0.9"});
     for (const auto& [k, v] : a.headers) headers.push_back({k, v});
 
-    auto resp = http_send(client, a.method, wire_url, headers);
-    if (!resp.ok)
-        return std::unexpected(ToolError::network("fetch failed: " + resp.err));
+    const bool cacheable = a.method == "GET" && !has_credential_header(a.headers);
+    const std::string cache_key = a.method + " " + wire_url + (a.allow_jina ? " +jina" : "");
+    std::optional<ToolState::CachedFetch> hit = cacheable ? cache_get(call, cache_key) : std::nullopt;
 
-    std::string raw_body = std::move(resp.body);
-    bool html_in = looks_like_html(resp.content_type, raw_body);
+    int status = 0;
+    std::string content_type, raw_body;
+    if (hit) {
+        status = hit->status; content_type = hit->content_type; raw_body = hit->body;
+    } else {
+        auto resp = http_send(client, a.method, wire_url, headers);
+        if (!resp.ok)
+            return std::unexpected(ToolError::network("fetch failed: " + resp.err));
+        status = resp.status;
+        content_type = std::move(resp.content_type);
+        raw_body = std::move(resp.body);
+        if (cacheable && status >= 200 && status < 300)
+            cache_put(call, {cache_key, status, content_type, raw_body});
+    }
+
+    raw_body = decode_charset(std::move(raw_body), declared_charset(content_type, raw_body));
+    bool html_in = looks_like_html(content_type, raw_body);
     size_t raw_size = raw_body.size();
 
     std::string body;
@@ -1041,22 +1188,30 @@ ExecResult run_web_fetch(HttpClient& client, const WebFetchArgs& a, bool jina) {
     }
 
     bool used_jina = false;
-    if (html_in && a.allow_jina && jina
-        && looks_like_spa_shell(body, raw_body)
-        && a.method == "GET")
-    {
-        std::vector<std::pair<std::string,std::string>> jh;
-        jh.push_back({"user-agent",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"});
-        jh.push_back({"accept", "text/plain, text/markdown, */*"});
-        jh.push_back({"x-return-format", "markdown"});
-        auto jr = http_send(client, "GET", "https://r.jina.ai/" + a.url, jh);
-        if (jr.ok && jr.status >= 200 && jr.status < 300 && !jr.body.empty()) {
-            std::string jbody = drop_link_rail_runs(std::move(jr.body));
-            if (jbody.size() > body.size() + 200) {
-                body = std::move(jbody);
-                used_jina = true;
+    std::string spa_note;
+    const bool spa = html_in && a.method == "GET" && looks_like_spa_shell(body, raw_body);
+    if (spa && (!a.allow_jina || !jina)) {
+        spa_note = "\n[this page appears to need JavaScript — the text above is only its "
+                   "static shell. Re-run with render: \"jina\" to render it via r.jina.ai "
+                   "(sends the URL to that third party)]";
+    } else if (spa) {
+        if (url_has_secret(a.url) || host_is_internal_name(pu->host) || has_credential_header(a.headers)) {
+            spa_note = "\n[render: \"jina\" refused: the URL carries credentials or a token, or "
+                       "names an internal host, and would be sent to a third party]";
+        } else {
+            std::vector<std::pair<std::string,std::string>> jh;
+            jh.push_back({"user-agent",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"});
+            jh.push_back({"accept", "text/plain, text/markdown, */*"});
+            jh.push_back({"x-return-format", "markdown"});
+            auto jr = http_send(client, "GET", "https://r.jina.ai/" + wire_url, jh);
+            if (jr.ok && jr.status >= 200 && jr.status < 300 && !jr.body.empty()) {
+                std::string jbody = drop_link_rail_runs(std::move(jr.body));
+                if (jbody.size() > body.size() + 200) {
+                    body = std::move(jbody);
+                    used_jina = true;
+                }
             }
         }
     }
@@ -1067,28 +1222,34 @@ ExecResult run_web_fetch(HttpClient& client, const WebFetchArgs& a, bool jina) {
             body = std::move(clipped);
     }
 
-    bool truncated = false;
-    if (body.size() > kMaxFetchBytes) {
-        body.resize(util::safe_utf8_cut(body, kMaxFetchBytes));
-        truncated = true;
-    }
+    // Paging: return [start_char, start_char + max_chars) of the extracted
+    // text, cut on UTF-8 boundaries, and say where the next page starts.
     body = util::to_valid_utf8(std::move(body));
+    const std::size_t total = body.size();
+    const std::size_t start = std::min<std::size_t>(static_cast<std::size_t>(a.start_char), total);
+    std::size_t begin = start;
+    while (begin < total && (static_cast<unsigned char>(body[begin]) & 0xC0) == 0x80) ++begin;
+    std::string page = body.substr(begin);
+    bool more = false;
+    if (page.size() > static_cast<std::size_t>(a.max_chars)) {
+        page.resize(util::safe_utf8_cut(page, static_cast<std::size_t>(a.max_chars)));
+        more = true;
+    }
+    const std::size_t end = begin + page.size();
 
     std::ostringstream out;
-    out << "HTTP " << resp.status;
-    if (!resp.content_type.empty()) out << " (" << resp.content_type << ")";
-    if (used_jina) out << " [via r.jina.ai: SPA fallback]";
+    out << "HTTP " << status;
+    if (!content_type.empty()) out << " (" << content_type << ")";
+    if (hit) out << " (cached: fetched earlier in this session)";
+    if (used_jina) out << " [via r.jina.ai: rendered]";
     if (!fragment.empty()) out << " [#" << fragment << "]";
-    out << "\n\n" << body;
-    if (html_in && !used_jina) {
-        out << "\n[extracted text from " << raw_size << " bytes of HTML";
-        if (truncated) out << ", truncated at 64KB";
-        out << "]";
-    } else if (truncated) {
-        out << "\n[body truncated at 64KB]";
-    }
-    std::string s = out.str();
-    return ToolOutput{std::move(s), std::nullopt};
+    out << "\n\n" << page;
+    if (html_in && !used_jina) out << "\n[extracted text from " << raw_size << " bytes of HTML]";
+    if (more || begin > 0)
+        out << "\n[showing chars " << begin << "-" << end << " of " << total
+            << (more ? "; pass start_char=" + std::to_string(end) + " for more]" : "]");
+    out << spa_note;
+    return ToolOutput{out.str(), std::nullopt};
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1099,6 +1260,8 @@ struct WebSearchArgs {
     std::string query;
     int count = 10;
     std::string display_description;
+    std::vector<std::string> allowed_domains;
+    std::vector<std::string> blocked_domains;
 };
 
 const util::ArgSpec<WebSearchArgs>& kWebSearchArgs() {
@@ -1107,8 +1270,37 @@ const util::ArgSpec<WebSearchArgs>& kWebSearchArgs() {
                   "One-line summary shown in the UI. Optional."),
         util::arg(&WebSearchArgs::query, "query", "Search query").required(),
         util::arg(&WebSearchArgs::count, "count", "Max results (default: 10)"),
+        util::arg(&WebSearchArgs::allowed_domains, "allowed_domains",
+                  "Only return results from these domains (subdomains included), e.g. "
+                  "[\"docs.python.org\", \"github.com\"]."),
+        util::arg(&WebSearchArgs::blocked_domains, "blocked_domains",
+                  "Never return results from these domains (subdomains included)."),
     };
     return spec;
+}
+
+// "https://Sub.Example.com:8443/x" -> "sub.example.com"
+std::string url_host(std::string_view url) {
+    if (auto p = url.find("://"); p != std::string_view::npos) url.remove_prefix(p + 3);
+    url = url.substr(0, url.find_first_of("/?#"));
+    if (auto at = url.rfind('@'); at != std::string_view::npos) url.remove_prefix(at + 1);
+    if (!url.starts_with('[')) url = url.substr(0, url.find(':'));
+    std::string h{url};
+    for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return h;
+}
+
+// "example.com" matches example.com and *.example.com, never badexample.com.
+bool host_in(std::string_view host, const std::vector<std::string>& domains) {
+    for (std::string d : domains) {
+        for (char& c : d) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (d.starts_with("*.")) d.erase(0, 2);
+        d = url_host(d.find("://") == std::string::npos ? "x://" + d : d);
+        if (d.empty()) continue;
+        if (host == d || (host.size() > d.size() && host.ends_with(d) && host[host.size() - d.size() - 1] == '.'))
+            return true;
+    }
+    return false;
 }
 
 std::string url_unescape(std::string_view s) {
@@ -1350,8 +1542,19 @@ ExecResult run_web_search(HttpClient& client, const WebSearchPlan& plan,
 
         WebSearchQuery q;
         q.text = a.query;
+        // Steer the engine toward the allowed domains when there are few
+        // enough to express as `site:` operators; the result filter below is
+        // what actually enforces them.
+        if (!a.allowed_domains.empty() && a.allowed_domains.size() <= 3
+            && a.query.find("site:") == std::string::npos) {
+            std::string sites;
+            for (std::size_t i = 0; i < a.allowed_domains.size(); ++i)
+                sites += (i ? " OR site:" : "site:") + a.allowed_domains[i];
+            q.text += a.allowed_domains.size() == 1 ? " " + sites : " (" + sites + ")";
+        }
+        for (const auto& d : a.blocked_domains) q.text += " -site:" + d;
         if (has_native_exclude(svc->id)) {
-            auto split = split_site_exclusions(a.query);
+            auto split = split_site_exclusions(q.text);
             q.text = std::move(split.query);
             q.exclude = std::move(split.exclude);
         }
@@ -1452,18 +1655,32 @@ ExecResult run_web_search(HttpClient& client, const WebSearchPlan& plan,
         }
         hits = std::move(uniq);
     }
+    std::size_t filtered = 0;
+    if (!a.allowed_domains.empty() || !a.blocked_domains.empty()) {
+        const auto before = hits.size();
+        std::erase_if(hits, [&](const SearchHit& h) {
+            const std::string host = url_host(h.url);
+            if (!a.allowed_domains.empty() && !host_in(host, a.allowed_domains)) return true;
+            return host_in(host, a.blocked_domains);
+        });
+        filtered = before - hits.size();
+    }
 
     if (hits.empty()) {
         std::ostringstream err;
-        err << "search returned no results for: " << a.query << "\n"
-            << "tried " << diagnostics.size() << " engines:";
+        err << "search returned no results for: " << a.query << "\n";
+        if (filtered)
+            err << "(" << filtered << " result(s) were dropped by allowed_domains/blocked_domains)\n";
+        err << "tried " << diagnostics.size() << " engines:";
         for (const auto& [name, why] : diagnostics)
             err << "\n  - " << name << ": " << why;
         return ToolOutput{err.str(), std::nullopt};
     }
 
     std::ostringstream out;
-    out << "[via " << used_engine << "]\n\n";
+    out << "[via " << used_engine << "]";
+    if (filtered) out << " (" << filtered << " result(s) outside the domain filter dropped)";
+    out << "\n\n";
     int i = 1;
     for (const auto& h : hits) {
         out << i++ << ". " << h.title << "\n";
@@ -1482,16 +1699,18 @@ void register_web_tools(Shells& sh, const std::shared_ptr<HttpClient>& http, boo
     if (!http) return;   // no transport → no web tools
 
     sh.add("web_fetch",
-        "Fetch a URL (HTTPS, follows redirects). For HTML pages, returns "
-        "extracted plain text with links preserved as [text](url) — not raw "
-        "HTML. Up to 64KB of cleaned content. Use for docs, articles, APIs. "
-        "Supports #fragment to clip the output to that section. "
-        "JS/SPA pages are auto-rendered via r.jina.ai when the primary "
-        "fetch returns a near-empty shell (disable per-request by sending "
-        "a `x-no-jina: 1` header).",
+        "Fetch a URL (HTTPS, follows redirects; every hop is SSRF-checked and "
+        "credentials are dropped on a cross-origin redirect). For HTML pages, "
+        "returns extracted text with links preserved as [text](url) — not raw "
+        "HTML; legacy charsets are decoded to UTF-8. Returns up to `max_chars` "
+        "(default 64000) of text; long pages say where the next page starts "
+        "(`start_char`). Supports #fragment to clip the output to that section. "
+        "Repeat fetches in this session are served from a cache (noted in the "
+        "header). Pages that need JavaScript are flagged; `render: \"jina\"` "
+        "renders them via r.jina.ai, a third party, so it is opt-in only.",
         kWebFetchArgs().schema(), EffectSet{Effect::Net},
-        body<WebFetchArgs>([http, jina](const WebFetchArgs& a) {
-            return run_web_fetch(*http, a, jina);
+        body<WebFetchArgs>([http, jina](const Call& c, const WebFetchArgs& a) {
+            return run_web_fetch(c, *http, a, jina);
         }, kWebFetchArgs(), check_web_fetch), 20'000);
 
     sh.add("web_search",
@@ -1499,8 +1718,10 @@ void register_web_tools(Shells& sh, const std::shared_ptr<HttpClient>& http, boo
         "returns results. Output is `[via ENGINE]` followed by numbered "
         "title / URL / snippet for each hit. Use web_fetch on a result URL "
         "to read the page. Standard search operators work in the query: "
-        "`site:docs.python.org`, `\"exact phrase\"`, `-exclude`. Duplicate "
-        "URLs (AMP / mobile / archive mirrors) are auto-deduped.",
+        "`site:docs.python.org`, `\"exact phrase\"`, `-exclude`; or pass "
+        "allowed_domains / blocked_domains to filter results. Duplicate "
+        "URLs (AMP / mobile / archive mirrors) are auto-deduped. Cite the URL "
+        "of any result you use.",
         kWebSearchArgs().schema(), EffectSet{Effect::Net},
         body<WebSearchArgs>([http, plans](const WebSearchArgs& a) {
             // Read the plan per call so a change in the host's settings reaches

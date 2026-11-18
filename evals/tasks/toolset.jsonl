@@ -11,3 +11,22 @@
 {"name": "json_query: slice length is one array", "tool": "json_query", "args": {"path": "package.json", "query": ".services[0:2] | length"}, "expect": {"equals": "2"}}
 {"name": "json_query: bad regex path is an error", "tool": "json_query", "args": {"path": "package.json", "query": ".services["}, "expect": {"is_error": true}}
 {"name": "replace: dry-run does not write", "tool": "replace", "args": {"find": "Widget", "replacement": "Gadget", "glob": "*.py"}, "expect": {"contains": ["DRY RUN", "Gadget"], "not_contains": ["Wrote"]}}
+// ── json_query: the jq engine ────────────────────────────────────────────────────
+{"name": "json_query: select + map", "tool": "json_query", "args": {"path": "package.json", "query": "[.services[] | select(.port > 5000) | .name]"}, "expect": {"equals": "[\"api\"]"}}
+{"name": "json_query: to_entries filter", "tool": "json_query", "args": {"path": "package.json", "query": ".dependencies | to_entries | map(select(.value | startswith(\"^18\"))) | map(.key)"}, "expect": {"equals": "[\"react\"]"}}
+{"name": "json_query: recursive descent + alternative", "tool": "json_query", "args": {"path": "package.json", "query": "[.. | .port? // empty]"}, "expect": {"equals": "[8080,3000]"}}
+{"name": "json_query: interpolation, raw", "tool": "json_query", "args": {"path": "package.json", "query": "\"\\(.name)@\\(.version)\"", "raw": true}, "expect": {"equals": "demo@2.4.0"}}
+{"name": "json_query: typo'd key explains the null", "tool": "json_query", "args": {"path": "package.json", "query": ".dependncies.react"}, "expect": {"contains": ["null", "missing key yields null"]}}
+// ── grep: smart case ────────────────────────────────────────────────────────────
+{"name": "grep: lowercase pattern matches any case", "tool": "grep", "args": {"pattern": "widget", "glob": "*.py"}, "expect": {"contains": ["class Widget"]}}
+{"name": "grep: uppercase letter makes it exact", "tool": "grep", "args": {"pattern": "WIDGET", "glob": "*.py"}, "expect": {"not_contains": ["class Widget"], "contains": ["smart case"]}}
+// ── edit: transparency and safety ──────────────────────────────────────────────
+{"name": "edit: exact match is reported", "tool": "edit", "args": {"path": "app.py", "edits": [{"old_text": "DEBOUNCE = 250", "new_text": "DEBOUNCE = 300"}]}, "expect": {"contains": ["Match:", "exact", "DEBOUNCE = 300"]}}
+{"name": "edit: replace_all never fuzzy-matches", "tool": "edit", "args": {"path": "app.py", "edits": [{"old_text": "DEBOUNCE = 999", "new_text": "X", "replace_all": true}]}, "expect": {"is_error": true}}
+{"name": "edit: a miss shows the closest real text", "tool": "edit", "args": {"path": "app.py", "edits": [{"old_text": "def render(self, ctx):\n        return f\"[{self.name}]\"", "new_text": "pass"}]}, "expect": {"is_error": true, "contains": ["Did you mean", "def render(self):"]}}
+// ── apply_patch: multi-file V4A ────────────────────────────────────────────────
+{"name": "apply_patch: V4A add + update in one call", "tool": "apply_patch", "args": {"patch": "*** Begin Patch\n*** Add File: notes.md\n+# Notes\n*** Update File: app.py\n@@\n-DEBOUNCE = 250\n+DEBOUNCE = 500\n*** End Patch\n"}, "expect": {"contains": ["Added", "notes.md", "DEBOUNCE = 500"]}}
+{"name": "apply_patch: V4A is all-or-nothing", "tool": "apply_patch", "args": {"patch": "*** Begin Patch\n*** Add File: should_not_exist.md\n+x\n*** Update File: app.py\n@@\n-THIS LINE IS NOT IN THE FILE\n+y\n*** End Patch\n"}, "expect": {"is_error": true, "contains": ["app.py"]}}
+// ── shell: hints and soft timeout ───────────────────────────────────────────────
+{"name": "shell: non-interactive env", "tool": "shell", "args": {"command": "echo PAGER=$PAGER GTP=$GIT_TERMINAL_PROMPT"}, "expect": {"contains": ["PAGER=cat", "GTP=0"]}}
+{"name": "shell: a slow command becomes a background session", "tool": "shell", "args": {"command": "echo started; sleep 4; echo done", "timeout": 1}, "expect": {"contains": ["started", "background session", "process_poll"]}}
