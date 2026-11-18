@@ -1,4 +1,5 @@
 #include <mcp/tools/util/fuzzy_match.hpp>
+#include <mcp/tools/util/find_bytes.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -428,13 +429,7 @@ std::string apply_indent_delta(std::string_view text, const IndentDelta& d) {
 // Count exact byte occurrences of `needle` in `file`.
 int count_occurrences(std::string_view file, std::string_view needle) noexcept {
     if (needle.empty() || needle.size() > file.size()) return 0;
-    int n = 0;
-    std::size_t p = 0;
-    while ((p = file.find(needle, p)) != std::string_view::npos) {
-        ++n;
-        p += needle.size();
-    }
-    return n;
+    return count_bytes(file, needle);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -759,9 +754,13 @@ FuzzyMatch fuzzy_find(std::string_view file,
     // Zero allocations, no DP. Single match wins outright; ambiguous cases
     // still need the DP because a `line_hint` can break the tie.
     {
-        int n = count_occurrences(file, needle);
+        // One scan finds the first hit and proves (or disproves) uniqueness.
+        const auto first = find_bytes(file, needle);
+        const int n = first == std::string_view::npos ? 0
+            : (find_bytes(file, needle, first + needle.size()) == std::string_view::npos
+                   ? 1 : count_occurrences(file, needle));
         if (n == 1) {
-            auto pos = file.find(needle);
+            const auto pos = first;
             FuzzyMatch ex{true, pos, needle.size(), 1, {}, 1};
             ex.ratio = 1.0;
             return ex;

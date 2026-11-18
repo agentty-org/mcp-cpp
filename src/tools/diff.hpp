@@ -22,8 +22,6 @@ struct Diff {
     int added   = 0;
     int removed = 0;
     std::vector<Hunk> hunks;
-    std::string before;
-    std::string after;
 };
 
 [[nodiscard]] Diff compute(const std::string& path,

@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <string_view>
 #include <unordered_map>
@@ -49,6 +50,85 @@ inline std::vector<std::string_view> split_views(std::string_view s) {
 }
 
 }  // namespace detail
+
+// Count '\n' in s, 8 bytes at a time (SWAR zero-byte detect + popcount).
+inline std::size_t count_newlines(std::string_view s) noexcept {
+    std::size_t n = 0, i = 0;
+    constexpr std::uint64_t kOnes = 0x0101010101010101ull, kHigh = 0x8080808080808080ull;
+    constexpr std::uint64_t kNl = kOnes * static_cast<unsigned char>('\n');
+    for (; i + 8 <= s.size(); i += 8) {
+        std::uint64_t w;
+        std::memcpy(&w, s.data() + i, 8);
+        w ^= kNl;                                   // '\n' bytes become 0
+        const std::uint64_t z = (w - kOnes) & ~w & kHigh;   // high bit set per zero byte
+        n += static_cast<std::size_t>(__builtin_popcountll(z));
+    }
+    for (; i < s.size(); ++i) n += s[i] == '\n';
+    return n;
+}
+
+// The part of a two-buffer diff worth splitting into lines.
+//
+// A one-line edit to a 30,000-line file used to split BOTH whole buffers
+// into lines (60,000 views) before Myers trimmed the common prefix and
+// suffix back off. Trim at the BYTE level first -- a few memcmp blocks --
+// widen to whole lines plus `ctx` lines of context on each side, and split
+// only that. `off` is how many lines precede the window, so window line i
+// is file line off+i (0-based) on both sides.
+struct Window {
+    std::vector<std::string_view> a, b;
+    int off = 0;
+};
+
+inline Window window(std::string_view before, std::string_view after, int ctx = 3) {
+    const std::size_t n = std::min(before.size(), after.size());
+    constexpr std::size_t kBlock = 4096;
+    std::size_t p = 0;
+    while (p + kBlock <= n && std::memcmp(before.data() + p, after.data() + p, kBlock) == 0) p += kBlock;
+    while (p < n && before[p] == after[p]) ++p;
+    std::size_t s = 0;
+    const std::size_t smax = n - p;
+    while (s + kBlock <= smax
+           && std::memcmp(before.data() + before.size() - s - kBlock,
+                          after.data() + after.size() - s - kBlock, kBlock) == 0)
+        s += kBlock;
+    while (s < smax && before[before.size() - 1 - s] == after[after.size() - 1 - s]) ++s;
+
+    // Head: back to the start of the line holding the first difference, then
+    // ctx more lines. Identical bytes in both buffers, so one offset serves.
+    std::size_t ws = 0;
+    if (p > 0) {
+        const auto nl = before.rfind('\n', p - 1);   // last '\n' at or before p-1
+        ws = nl == std::string_view::npos ? 0 : nl + 1;
+    }
+    for (int k = 0; k < ctx && ws > 0; ++k) {
+        const auto nl = ws >= 2 ? before.rfind('\n', ws - 2) : std::string_view::npos;
+        ws = nl == std::string_view::npos ? 0 : nl + 1;
+    }
+
+    // Tail: the common suffix starts at before.size()-s; extend the window
+    // forward to the end of that line, then ctx more lines. The '\n' bytes it
+    // stops after lie inside the common suffix, so both sides agree.
+    std::size_t we = before.size() - s;
+    for (int k = 0; k <= ctx && we < before.size(); ++k) {
+        const auto nl = before.find('\n', we);
+        we = nl == std::string_view::npos ? before.size() : nl + 1;
+    }
+    const std::size_t tail = before.size() - we;
+
+    Window w;
+    w.off = static_cast<int>(count_newlines(before.substr(0, ws)));
+    w.a = detail::split_views(before.substr(ws, we - ws));
+    w.b = detail::split_views(after.substr(ws, after.size() - tail - ws));
+    // A window that stops short of the end ends just after a '\n'; the empty
+    // "line" split_views reports after it is not a line (the real next line
+    // is in the trimmed tail).
+    if (tail > 0) {
+        if (!w.a.empty() && w.a.back().empty()) w.a.pop_back();
+        if (!w.b.empty() && w.b.back().empty()) w.b.pop_back();
+    }
+    return w;
+}
 
 // Edit script turning a into b, in order, common prefix/suffix as Keep.
 template <class Line>

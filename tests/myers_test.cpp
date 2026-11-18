@@ -76,6 +76,48 @@ int main() {
     int ch = 0;
     for (const auto& e : es) ch += e.k != myers::Edit::Keep;
     check(ch == 2, "one-line edit in 5000 lines is 2 changes", -5);
+
+    // window(): the lines it leaves out are identical on both sides, and the
+    // lines it keeps are exactly the full split's lines at [off, off+len).
+    std::mt19937 wr(99);
+    auto join = [](const std::vector<std::string>& v, bool trailing_nl) {
+        std::string s;
+        for (std::size_t i = 0; i < v.size(); ++i) { s += v[i]; if (i + 1 < v.size() || trailing_nl) s += '\n'; }
+        return s;
+    };
+    for (int seed = 0; seed < 4000; ++seed) {
+        std::vector<std::string> la;
+        const int nlines = (int)(wr() % 30);
+        for (int i = 0; i < nlines; ++i) la.push_back(std::string((wr() % 3), char('a' + wr() % 3)));
+        auto lb = la;
+        for (int k = 0, m = (int)(wr() % 4); k < m; ++k) {
+            const int op = (int)(wr() % 3);
+            if (op == 0 && !lb.empty()) lb.erase(lb.begin() + (long)(wr() % lb.size()));
+            else if (op == 1) lb.insert(lb.begin() + (long)(lb.empty() ? 0 : wr() % (lb.size() + 1)), std::string(1, char('a' + wr() % 3)));
+            else if (!lb.empty()) lb[wr() % lb.size()] += 'x';
+        }
+        const std::string A = join(la, wr() % 2), B = join(lb, wr() % 2);
+        const auto fa = myers::detail::split_views(A), fb = myers::detail::split_views(B);
+        const int ctx = (int)(wr() % 4);
+        const auto w = myers::window(A, B, ctx);
+        bool ok = w.off >= 0 && (std::size_t)w.off + w.a.size() <= fa.size()
+                  && (std::size_t)w.off + w.b.size() <= fb.size();
+        if (ok) {
+            for (int i = 0; i < w.off; ++i) ok = ok && fa[i] == fb[i];
+            for (std::size_t i = 0; i < w.a.size(); ++i) ok = ok && w.a[i] == fa[w.off + i];
+            for (std::size_t i = 0; i < w.b.size(); ++i) ok = ok && w.b[i] == fb[w.off + i];
+            const std::size_t ta = fa.size() - w.off - w.a.size(), tb = fb.size() - w.off - w.b.size();
+            ok = ok && ta == tb;
+            for (std::size_t i = 0; ok && i < ta; ++i) ok = ok && fa[fa.size() - 1 - i] == fb[fb.size() - 1 - i];
+            // And the edit count over the window equals the full minimal count.
+            int full = 0, part = 0;
+            for (const auto& e : myers::diff(fa, fb)) full += e.k != myers::Edit::Keep;
+            for (const auto& e : myers::diff(w.a, w.b)) part += e.k != myers::Edit::Keep;
+            ok = ok && full == part;
+        }
+        check(ok, "window is exact and keeps the minimal edit count", seed);
+        if (!ok) break;
+    }
     if (fails == 0) std::printf("myers_test: all passed\n");
     return fails == 0 ? 0 : 1;
 }

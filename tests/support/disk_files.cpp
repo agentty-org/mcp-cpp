@@ -180,12 +180,34 @@ std::string native_write(const fs::path& p, std::string_view content) {
 #ifndef _WIN32
     mode_t target_mode = 0644;
     bool   had_mode    = false;
+    nlink_t links      = 1;
     {
         struct stat st{};
         if (::stat(real.c_str(), &st) == 0) {
             target_mode = st.st_mode & 07777;
             had_mode    = true;
+            links       = st.st_nlink;
         }
+    }
+    // Mirrors agentty's DiskFiles: a read-only file is refused (the rename
+    // would replace it through its permission bit), and a hard-linked file
+    // is rewritten in place so its other names keep seeing the change.
+    if (had_mode && ::access(real.c_str(), W_OK) != 0 && errno == EACCES)
+        return "'" + p.string() + "' is read-only; not modified.";
+    if (had_mode && links > 1) {
+        int fd = ::open(real.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC);
+        if (fd < 0) return "cannot open '" + p.string() + "' for writing";
+        const char* d = content.data();
+        std::size_t left = content.size();
+        while (left > 0) {
+            const ssize_t n = ::write(fd, d, left);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { ::close(fd); return "write to '" + p.string() + "' failed"; }
+            d += n;
+            left -= static_cast<std::size_t>(n);
+        }
+        ::close(fd);
+        return {};
     }
 #endif
 

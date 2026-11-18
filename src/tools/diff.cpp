@@ -34,11 +34,13 @@ Diff compute(const std::string& path,
              const std::string& after) {
     Diff c;
     c.path   = path;
-    c.before = before;
-    c.after  = after;
 
-    const auto a = split_views(before);
-    const auto b = split_views(after);
+    // Only the changed region (plus context) is split into lines; `off` maps
+    // window line numbers back to file line numbers.
+    const auto win = myers::window(before, after, 3);
+    const auto& a = win.a;
+    const auto& b = win.b;
+    const int off = win.off;
     auto edits = compute_edits(a, b);
 
     const int ctx = 3;
@@ -89,17 +91,17 @@ Diff compute(const std::string& path,
             const auto& e = edits[i2];
             if (e.k == Edit::Keep) {
                 flush_run();
-                if (old_start < 0) old_start = e.a_idx + 1;
-                if (new_start < 0) new_start = e.b_idx + 1;
+                if (old_start < 0) old_start = off + e.a_idx + 1;
+                if (new_start < 0) new_start = off + e.b_idx + 1;
                 old_len++; new_len++;
                 patch << " " << a[static_cast<std::size_t>(e.a_idx)] << "\n";
             } else if (e.k == Edit::Del) {
-                if (old_start < 0) old_start = e.a_idx + 1;
+                if (old_start < 0) old_start = off + e.a_idx + 1;
                 old_len++;
                 del_buf += "-"; del_buf += a[static_cast<std::size_t>(e.a_idx)]; del_buf += "\n";
                 removed++;
             } else {
-                if (new_start < 0) new_start = e.b_idx + 1;
+                if (new_start < 0) new_start = off + e.b_idx + 1;
                 new_len++;
                 ins_buf += "+"; ins_buf += b[static_cast<std::size_t>(e.b_idx)]; ins_buf += "\n";
                 added++;

@@ -14,9 +14,11 @@
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/fuzzy_match.hpp>
+#include <mcp/tools/util/find_bytes.hpp>
 #include <mcp/tools/util/error.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <expected>
@@ -45,10 +47,22 @@ namespace {
 
 inline bool is_utf8_cont(unsigned char c) { return (c & 0xC0) == 0x80; }
 
-std::string minimal_splice(const std::string& buf,
-                           std::size_t region_pos,
-                           std::size_t region_len,
-                           std::string_view repl) {
+// Replace buf[region_pos, region_pos+region_len) with `repl`, IN PLACE, and
+// only the bytes that actually differ (a common prefix/suffix of the matched
+// region and the replacement is left alone, UTF-8 boundaries respected).
+// In place matters: building a fresh copy of a 1 MiB buffer per edit was
+// most of an edit's cost on a large file.
+void minimal_splice(std::string& buf,
+                    std::size_t region_pos,
+                    std::size_t region_len,
+                    std::string_view repl) {
+    // `repl` may alias `buf` (it never does today, but replace() with an
+    // aliased source is UB-adjacent): copy it out in that case.
+    std::string own;
+    if (repl.data() >= buf.data() && repl.data() < buf.data() + buf.size()) {
+        own.assign(repl);
+        repl = own;
+    }
     std::string_view matched{buf.data() + region_pos, region_len};
     std::size_t pre = 0;
     const std::size_t maxpre = std::min(matched.size(), repl.size());
@@ -64,25 +78,10 @@ std::string minimal_splice(const std::string& buf,
     while (suf > 0
            && is_utf8_cont(static_cast<unsigned char>(matched[matched.size() - suf])))
         --suf;
-    if (pre + suf >= matched.size() && pre + suf >= repl.size())
-        return buf;
-    if (pre == 0 && suf == 0) {
-        std::string out;
-        out.reserve(buf.size() - region_len + repl.size());
-        out.append(buf, 0, region_pos);
-        out.append(repl);
-        out.append(buf, region_pos + region_len, std::string::npos);
-        return out;
-    }
-    std::string_view repl_mid{repl.data() + pre, repl.size() - pre - suf};
+    if (pre + suf >= matched.size() && pre + suf >= repl.size()) return;
     const std::size_t cut_begin = region_pos + pre;
-    const std::size_t cut_end   = region_pos + region_len - suf;
-    std::string out;
-    out.reserve(buf.size() - (cut_end - cut_begin) + repl_mid.size());
-    out.append(buf, 0, cut_begin);
-    out.append(repl_mid);
-    out.append(buf, cut_end, std::string::npos);
-    return out;
+    const std::size_t cut_len   = region_len - pre - suf;
+    buf.replace(cut_begin, cut_len, repl.data() + pre, repl.size() - pre - suf);
 }
 
 struct OneEdit {
@@ -172,10 +171,40 @@ std::expected<EditArgs, ToolError> check_edit_args(EditArgs a, const util::Bound
 }
 
 int line_of_offset(std::string_view s, std::size_t off) noexcept {
+    // memchr is SIMD in every libc; a byte loop here ran twice per edit over
+    // up to the whole 1 MiB buffer.
     int line = 1;
-    auto cap = std::min(off, s.size());
-    for (std::size_t i = 0; i < cap; ++i) if (s[i] == '\n') ++line;
+    const char* p = s.data();
+    const char* const e = s.data() + std::min(off, s.size());
+    while (p < e) {
+        const void* nl = std::memchr(p, '\n', static_cast<std::size_t>(e - p));
+        if (!nl) break;
+        ++line;
+        p = static_cast<const char*>(nl) + 1;
+    }
     return line;
+}
+
+// Length of the common prefix / suffix of a and b, a block of memcmp at a
+// time before the byte loop: the edit loop asks this of two ~1 MiB buffers
+// that differ in a few bytes.
+std::size_t common_prefix(std::string_view a, std::string_view b) noexcept {
+    const std::size_t n = std::min(a.size(), b.size());
+    constexpr std::size_t kBlock = 4096;
+    std::size_t i = 0;
+    while (i + kBlock <= n && std::memcmp(a.data() + i, b.data() + i, kBlock) == 0) i += kBlock;
+    while (i < n && a[i] == b[i]) ++i;
+    return i;
+}
+std::size_t common_suffix(std::string_view a, std::string_view b, std::size_t limit) noexcept {
+    const std::size_t n = std::min({a.size(), b.size(), limit});
+    constexpr std::size_t kBlock = 4096;
+    std::size_t i = 0;
+    while (i + kBlock <= n
+           && std::memcmp(a.data() + a.size() - i - kBlock, b.data() + b.size() - i - kBlock, kBlock) == 0)
+        i += kBlock;
+    while (i < n && a[a.size() - 1 - i] == b[b.size() - 1 - i]) ++i;
+    return i;
 }
 
 std::vector<int> hit_lines(std::string_view buf, std::string_view needle,
@@ -538,19 +567,23 @@ int apply_one(std::string& buf, const OneEdit& e,
 
     auto replace_exact = [&](std::string_view needle,
                              std::string_view replacement) -> int {
+        auto pos = util::find_bytes(buf, needle);
+        if (pos == std::string::npos) return 0;
+        // One hit (the common case): splice in place, no second buffer.
+        if (util::find_bytes(buf, needle, pos + needle.size()) == std::string::npos) {
+            buf.replace(pos, needle.size(), replacement);
+            return 1;
+        }
         std::string out;
         out.reserve(buf.size());
         std::size_t cursor = 0;
         int n = 0;
-        for (;;) {
-            auto pos = buf.find(needle, cursor);
-            if (pos == std::string::npos) break;
+        for (; pos != std::string::npos; pos = util::find_bytes(buf, needle, cursor)) {
             out.append(buf, cursor, pos - cursor);
             out.append(replacement);
             cursor = pos + needle.size();
             ++n;
         }
-        if (n == 0) return 0;
         out.append(buf, cursor, std::string::npos);
         buf = std::move(out);
         return n;
@@ -590,11 +623,11 @@ int apply_one(std::string& buf, const OneEdit& e,
     if (!e.new_text.empty()
         && e.new_text.size() >= 8
         && e.new_text != e.old_text
-        && buf.find(e.old_text) == std::string::npos)
+        && util::find_bytes(buf, e.old_text) == std::string::npos)
     {
-        const auto first = buf.find(e.new_text);
+        const auto first = util::find_bytes(buf, e.new_text);
         if (first != std::string::npos
-            && buf.find(e.new_text, first + 1) == std::string::npos)
+            && util::find_bytes(buf, e.new_text, first + 1) == std::string::npos)
         {
             err.clear();
             return kIdempotentNoOp;
@@ -627,7 +660,7 @@ int apply_one(std::string& buf, const OneEdit& e,
             std::string_view repl = fm.adjusted_new_text.empty()
                 ? std::string_view{e.new_text}
                 : std::string_view{fm.adjusted_new_text};
-            buf = minimal_splice(buf, fm.pos, fm.len, repl);
+            minimal_splice(buf, fm.pos, fm.len, repl);
             return 1;
         }
         if (int ln = closest_line_hint(buf, e.old_text); ln > 0) {
@@ -767,7 +800,7 @@ int apply_one(std::string& buf, const OneEdit& e,
                         mi.strategy = "whitespace-normalised";
                         mi.exact = false;
                         mi.pos = byte_pos; mi.len = byte_end - byte_pos;
-                        buf = minimal_splice(buf, byte_pos,
+                        minimal_splice(buf, byte_pos,
                                              byte_end - byte_pos, e.new_text);
                         return 1;
                     }
@@ -801,15 +834,22 @@ int apply_one(std::string& buf, const OneEdit& e,
             ? std::string_view{e.new_text}
             : std::string_view{m.adjusted_new_text};
     classify_fuzzy(mi, buf, e.old_text, m);
-    buf = minimal_splice(buf, m.pos, m.len, repl);
+    minimal_splice(buf, m.pos, m.len, repl);
     return 1;
 }
 
 // Dominant line ending: CRLF only when \r\n outnumbers bare \n.
 bool dominant_crlf(std::string_view s) noexcept {
+    // No '\r' at all (nearly every file): LF, decided by one SIMD memchr
+    // instead of a byte loop over the whole buffer.
+    if (std::memchr(s.data(), '\r', s.size()) == nullptr) return false;
     std::size_t crlf = 0, lf = 0;
-    for (std::size_t i = 0; i < s.size(); ++i)
-        if (s[i] == '\n') { if (i > 0 && s[i - 1] == '\r') ++crlf; else ++lf; }
+    const char* p = s.data();
+    const char* const e = s.data() + s.size();
+    while (const char* nl = static_cast<const char*>(std::memchr(p, '\n', static_cast<std::size_t>(e - p)))) {
+        if (nl > s.data() && nl[-1] == '\r') ++crlf; else ++lf;
+        p = nl + 1;
+    }
     return crlf > lf;
 }
 
@@ -897,6 +937,10 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
     // Read through a hard cap as well as checking metadata above. The path may
     // grow or be replaced between stat and open; a size-only preflight is not
     // a memory bound. Reading at most cap+1 makes that race fail closed.
+    // What the file looked like when we read it, so a write by someone else
+    // (a formatter on save, a build step, the user in their editor) between
+    // our read and our write is noticed instead of silently overwritten.
+    const auto read_stat = call.fs().stat(p);
     auto bounded = call.fs().read_prefix(p, static_cast<std::size_t>(kMaxEditBytes) + 1);
     if (!bounded)
         return std::unexpected(ToolError::io(
@@ -959,13 +1003,17 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
             if (!c.regex) { c.old_text = to_crlf(c.old_text); c.new_text = to_crlf(c.new_text); }
             crlf_edits.push_back(std::move(c));
         }
+    // The bytes from before the current edit, so a failed count or an
+    // overlapping fuzzy match can be undone exactly. ONE buffer reused for
+    // every edit: assign() keeps its capacity, so after the first edit this
+    // is a memcpy into warm pages instead of a fresh 1 MiB allocation.
+    std::string before_this;
+    before_this.reserve(updated.size() + 4096);
     for (std::size_t i = 0; i < a.edits.size(); ++i) {
         const auto& ed = edit_at(i);
         if (ed.old_text == ed.new_text) { ++skipped_noop; continue; }
         std::string err;
-        // apply_one rewrites `updated` in place; keep the bytes from before
-        // so an edit that fails its count can be undone exactly.
-        std::string before_this = updated;
+        before_this.assign(updated);
         MatchInfo mi;
         int n = apply_one(updated, ed, a.path->string(), err, mi);
         // old_text copied straight out of a read keeps its "   12\t" prefixes.
@@ -975,10 +1023,10 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
             if (strip_read_line_numbers(bare.old_text)) {
                 (void)strip_read_line_numbers(bare.new_text);
                 std::string retry_err;
-                updated = before_this;
+                updated.assign(before_this);
                 const int m = apply_one(updated, bare, a.path->string(), retry_err, mi);
                 if (m != 0) n = m;
-                else updated = before_this;
+                else updated.assign(before_this);
             }
         }
         if (n == kIdempotentNoOp) {
@@ -994,7 +1042,7 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
             // hid it from both the failure count and the message. (The undo
             // used to re-run the earlier edits' matchers on the original,
             // which could land them somewhere else.)
-            updated = std::move(before_this);
+            updated.assign(before_this);
             outcomes.push_back({i, 0, true, std::format(
                 "expected_replacements={} but matched {} occurrence(s); not applied",
                 ed.expected_replacements, n)});
@@ -1015,13 +1063,9 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
             continue;
         }
         // Changed byte range of this edit, in the post-edit buffer.
-        std::size_t pre = 0;
-        while (pre < before_this.size() && pre < updated.size()
-               && before_this[pre] == updated[pre]) ++pre;
-        std::size_t suf = 0;
-        while (suf < before_this.size() - pre && suf < updated.size() - pre
-               && before_this[before_this.size() - 1 - suf]
-                  == updated[updated.size() - 1 - suf]) ++suf;
+        const std::size_t pre = common_prefix(before_this, updated);
+        const std::size_t suf = common_suffix(before_this, updated,
+                                              std::min(before_this.size(), updated.size()) - pre);
         const std::size_t old_end = before_this.size() - suf;
         const std::size_t new_end = updated.size() - suf;
         if (!mi.exact && mi.pos != std::string::npos) {
@@ -1030,7 +1074,7 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
             for (auto [wlo, whi] : written)
                 if (lo < std::max(whi, wlo + 1) && wlo < std::max(hi, lo + 1)) { overlap = true; break; }
             if (overlap) {
-                updated = std::move(before_this);
+                updated.assign(before_this);
                 outcomes.push_back({i, 0, false, std::format(
                     "edit {} only matched non-exactly ({}) and that region "
                     "overlaps text written by an earlier edit in this call; "
@@ -1117,16 +1161,26 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
               "there.", std::nullopt};
 
     auto d = diff::compute(a.path->string(), original, updated);
-    if (auto werr = util::write_file(*a.path, bom + updated); !werr.empty())
+    // Someone else wrote the file between our read and now (a formatter on
+    // save, a build step, the user's editor): writing would silently throw
+    // their change away. Refuse instead; the model re-reads and retries.
+    {
+        const auto now = call.fs().stat(p);
+        if (now.mtime != read_stat.mtime || now.size != read_stat.size)
+            return std::unexpected(ToolError::io(
+                "the file changed on disk while this edit was being applied (another "
+                "process wrote it). Nothing was written, so that change is kept. "
+                "Re-read the file and retry the edit."));
+    }
+    // The bytes going to disk, built ONCE and reused for the write, the
+    // seen-hash and the FileChange (it used to be rebuilt three times).
+    std::string on_disk = bom.empty() ? updated : bom + updated;
+    if (auto werr = util::write_file(*a.path, on_disk); !werr.empty())
         return std::unexpected(ToolError::io(werr));
     {
-        std::error_code mt_ec;
         auto new_mtime = call.fs().stat(p).mtime;
-        if (!mt_ec) {
-            record_seen(call, p, new_mtime,
-                                   static_cast<std::uintmax_t>(bom.size() + updated.size()),
-                                   util::cheap_content_hash(bom + updated));
-        }
+        record_seen(call, p, new_mtime, static_cast<std::uintmax_t>(on_disk.size()),
+                    util::cheap_content_hash(on_disk));
     }
 
     std::string unified = diff::render_unified(d);
@@ -1216,7 +1270,9 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
     }
 
     // Carry the FileChange (before/after + counts) to the host diff-review UI.
-    FileChange change = make_change(a.path->string(), bom + original, bom + updated);
+    // The counts come from the diff already computed above.
+    FileChange change = make_change(a.path->string(), bom + original, std::move(on_disk),
+                                    d.added, d.removed);
     return ToolOutput{msg.str(), std::move(change)};
 }
 

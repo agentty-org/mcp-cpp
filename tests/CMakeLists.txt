@@ -91,6 +91,12 @@ add_executable(mcp_tool_bench tool_bench.cpp)
 target_link_libraries(mcp_tool_bench PRIVATE mcp::tools mcp_test_disk Threads::Threads)
 
 # The shared Myers diff (edit/write/apply_patch hunks): exact and minimal.
+add_executable(mcp_edit_stress edit_stress.cpp)
+target_link_libraries(mcp_edit_stress PRIVATE mcp::tools mcp_test_disk Threads::Threads)
+if(NOT WIN32)
+    add_test(NAME mcp_edit_stress COMMAND mcp_edit_stress)
+endif()
+
 add_executable(mcp_myers_test myers_test.cpp)
 target_link_libraries(mcp_myers_test PRIVATE mcp::tools)
 add_test(NAME mcp_myers_test COMMAND mcp_myers_test)

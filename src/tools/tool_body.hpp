@@ -154,5 +154,9 @@ template <class Args, class Run>
 [[nodiscard]] FileChange make_change(std::string path,
                                      std::string before,
                                      std::string after);
+// Same, when the caller already diffed (edit computes the diff once for its
+// rendered output; diffing again for the counts doubled the cost).
+[[nodiscard]] FileChange make_change(std::string path, std::string before,
+                                     std::string after, int added, int removed);
 
 } // namespace mcp::tools::detail
