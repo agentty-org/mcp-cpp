@@ -133,10 +133,18 @@ json indices_of(const json& t, const json& x) {
     fail("Cannot determine indices in " + describe(t));
 }
 
-// Regexes run on UTF-32 (std::wregex; wchar_t is 32-bit on the hosts we
-// build for), so `.` is one CHARACTER like Oniguruma, not one byte of a
-// multibyte sequence, and match offsets are code points as jq reports them.
-static_assert(sizeof(wchar_t) == 4, "jq regex needs a 32-bit wchar_t");
+// Regexes run on wide strings (std::wregex), so `.` is one CHARACTER like
+// Oniguruma, not one byte of a multibyte sequence. Where wchar_t is 32-bit
+// (Linux, macOS) a wide string is UTF-32 and positions are code points
+// already. Where it is 16-bit (Windows) it is UTF-16: a character above
+// U+FFFF is a surrogate pair, so `.` matches half of one there -- the only
+// difference, and only for astral characters -- and the offsets match()
+// reports are converted back to code points (cp_offset) so they agree with
+// jq on every host.
+constexpr bool kWide32 = sizeof(wchar_t) >= 4;
+static_assert(sizeof(wchar_t) == 2 || sizeof(wchar_t) == 4, "unexpected wchar_t size");
+
+[[nodiscard]] constexpr bool is_low_surrogate(std::uint32_t u) { return u >= 0xDC00 && u <= 0xDFFF; }
 
 std::wstring widen(std::string_view s) {
     std::wstring w;
@@ -153,7 +161,14 @@ std::wstring widen(std::string_view s) {
             cp = (cp << 6) | (cc & 0x3F);
         }
         if (!ok) { w += L'\xFFFD'; ++i; continue; }
-        w += static_cast<wchar_t>(cp);
+        if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;   // a surrogate is not a character
+        if (kWide32 || cp < 0x10000) {
+            w += static_cast<wchar_t>(cp);
+        } else {
+            cp -= 0x10000;
+            w += static_cast<wchar_t>(0xD800 + (cp >> 10));
+            w += static_cast<wchar_t>(0xDC00 + (cp & 0x3FF));
+        }
         i += static_cast<std::size_t>(len);
     }
     return w;
@@ -162,8 +177,17 @@ std::wstring widen(std::string_view s) {
 std::string narrow(std::wstring_view w) {
     std::string o;
     o.reserve(w.size());
-    for (wchar_t wc : w) {
-        const auto cp = static_cast<std::uint32_t>(wc);
+    for (std::size_t i = 0; i < w.size(); ++i) {
+        auto cp = static_cast<std::uint32_t>(w[i]) & (kWide32 ? 0xFFFFFFFFu : 0xFFFFu);
+        if constexpr (!kWide32) {
+            if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < w.size()
+                && is_low_surrogate(static_cast<std::uint32_t>(w[i + 1]) & 0xFFFFu)) {
+                cp = 0x10000 + ((cp - 0xD800) << 10)
+                   + ((static_cast<std::uint32_t>(w[++i]) & 0xFFFFu) - 0xDC00);
+            } else if (cp >= 0xD800 && cp <= 0xDFFF) {
+                cp = 0xFFFD;   // a lone half, e.g. `.` split a pair
+            }
+        }
         if (cp < 0x80) o += static_cast<char>(cp);
         else if (cp < 0x800) { o += static_cast<char>(0xC0 | (cp >> 6)); o += static_cast<char>(0x80 | (cp & 0x3F)); }
         else if (cp < 0x10000) { o += static_cast<char>(0xE0 | (cp >> 12)); o += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); o += static_cast<char>(0x80 | (cp & 0x3F)); }
@@ -246,13 +270,36 @@ Re compile(const std::string& pat, const std::string& flags) {
 
 using WMatch = std::wsmatch;
 
-json match_obj(const WMatch& m, const Re& r) {
-    json o{{"offset", m.position(0)}, {"length", m.length(0)}, {"string", narrow(m.str(0))}};
+// A position in `s` (wide units) as jq reports it: a code point index.
+[[nodiscard]] std::int64_t cp_offset(const std::wstring& s, std::size_t units) {
+    if constexpr (kWide32) {
+        return static_cast<std::int64_t>(units);
+    } else {
+        std::int64_t n = 0;
+        for (std::size_t i = 0; i < units && i < s.size(); ++i)
+            if (!is_low_surrogate(static_cast<std::uint32_t>(s[i]) & 0xFFFFu)) ++n;
+        return n;
+    }
+}
+
+json match_obj(const std::wstring& s, const WMatch& m, const Re& r) {
+    const auto span = [&](std::size_t i) {
+        const auto a = static_cast<std::size_t>(m.position(i));
+        const auto b = a + static_cast<std::size_t>(m.length(i));
+        const auto ca = cp_offset(s, a);
+        return std::pair{ca, cp_offset(s, b) - ca};
+    };
+    const auto [off, len] = span(0);
+    json o{{"offset", off}, {"length", len}, {"string", narrow(m.str(0))}};
     json caps = json::array();
     for (std::size_t i = 1; i < m.size(); ++i) {
         json c;
-        if (m[i].matched) c = {{"offset", m.position(i)}, {"length", m.length(i)}, {"string", narrow(m.str(i))}};
-        else c = {{"offset", -1}, {"length", 0}, {"string", nullptr}};
+        if (m[i].matched) {
+            const auto [co, cl] = span(i);
+            c = {{"offset", co}, {"length", cl}, {"string", narrow(m.str(i))}};
+        } else {
+            c = {{"offset", -1}, {"length", 0}, {"string", nullptr}};
+        }
         c["name"] = (i - 1 < r.names.size() && !r.names[i - 1].empty()) ? json(r.names[i - 1]) : json(nullptr);
         caps.push_back(std::move(c));
     }
@@ -306,9 +353,9 @@ void regex_fn(Ctx& cx, const Node& c, const json& in, const EnvP& env, const Out
             for_matches(s, r, [&](const WMatch&) { hit = true; });
             out(hit);
         } else if (fn == "match") {
-            for_matches(s, r, [&](const WMatch& m) { out(match_obj(m, r)); });
+            for_matches(s, r, [&](const WMatch& m) { out(match_obj(s, m, r)); });
         } else if (fn == "capture") {
-            for_matches(s, r, [&](const WMatch& m) { out(capture_obj(match_obj(m, r))); });
+            for_matches(s, r, [&](const WMatch& m) { out(capture_obj(match_obj(s, m, r))); });
         } else if (fn == "scan") {
             for_matches(s, r, [&](const WMatch& m) {
                 if (m.size() == 1) out(narrow(m.str(0)));
@@ -331,7 +378,7 @@ void regex_fn(Ctx& cx, const Node& c, const json& in, const EnvP& env, const Out
             for_matches(s, r, [&](const WMatch& m) {
                 const auto p = static_cast<std::size_t>(m.position(0));
                 result += sub(prev, p);
-                const json caps = capture_obj(match_obj(m, r));
+                const json caps = capture_obj(match_obj(s, m, r));
                 bool got = false;
                 eval(cx, *c.args[1], caps, env, [&](const json& rep) {
                     if (got) return;   // first output only
