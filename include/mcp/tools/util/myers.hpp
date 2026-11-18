@@ -15,6 +15,7 @@
 // not minimal (a wholesale rewrite, where minimality buys nothing).
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -61,7 +62,7 @@ inline std::size_t count_newlines(std::string_view s) noexcept {
         std::memcpy(&w, s.data() + i, 8);
         w ^= kNl;                                   // '\n' bytes become 0
         const std::uint64_t z = (w - kOnes) & ~w & kHigh;   // high bit set per zero byte
-        n += static_cast<std::size_t>(__builtin_popcountll(z));
+        n += static_cast<std::size_t>(std::popcount(z));
     }
     for (; i < s.size(); ++i) n += s[i] == '\n';
     return n;
